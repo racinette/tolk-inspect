@@ -3,6 +3,8 @@ import wasm from "../generated/tolk_inspect_wasm.cjs";
 export type NodeId = string;
 export type SymbolId = string;
 export type TypeId = string;
+export type ControlFlowNodeId = string;
+export type ControlFlowScope = "none" | "workspace" | "all";
 
 export interface ProjectInput {
   root: string;
@@ -11,6 +13,8 @@ export interface ProjectInput {
   stdlibRoot?: string;
   actonStdlibRoot?: string;
   importMappings?: Readonly<Record<string, string>>;
+  /** Controls CFG generation. Defaults to `workspace`. */
+  controlFlow?: ControlFlowScope;
 }
 
 export interface Position { readonly line: number; readonly character: number }
@@ -95,6 +99,30 @@ export type ConstantValue =
   | { readonly kind: "overflow"; readonly display: string }
   | { readonly kind: "unknown"; readonly display: string };
 
+export type ControlFlowNodeKind =
+  | "entry" | "exit" | "nop" | "expression" | "condition" | "assert"
+  | "return" | "throw" | "break" | "continue" | "matchPattern"
+  | "catchBinding" | "join";
+
+export type ControlFlowEdgeKind =
+  | "unconditional" | "trueBranch" | "falseBranch" | "loopBack"
+  | "break" | "continue" | "return" | "throw" | "exceptional";
+
+export interface ControlFlowNode {
+  readonly id: ControlFlowNodeId;
+  readonly kind: ControlFlowNodeKind;
+  readonly location?: SourceLocation;
+  readonly astNodeId?: NodeId;
+  readonly reads: readonly SymbolId[];
+  readonly writes: readonly SymbolId[];
+}
+
+export interface ControlFlowEdge {
+  readonly from: ControlFlowNodeId;
+  readonly to: ControlFlowNodeId;
+  readonly kind: ControlFlowEdgeKind;
+}
+
 export interface CallEdge {
   readonly caller: SymbolId;
   readonly callee: SymbolId;
@@ -131,11 +159,15 @@ interface RawSourceFile {
 interface RawResolution { nodeId: NodeId; symbolId?: SymbolId; resolved: boolean }
 interface RawNodeType { nodeId: NodeId; typeId: TypeId }
 interface RawSymbolConstantValue { symbolId: SymbolId; value: ConstantValue }
+interface RawControlFlowGraph {
+  symbolId: SymbolId; entry: ControlFlowNodeId; exit: ControlFlowNodeId;
+  nodes: ControlFlowNode[]; edges: ControlFlowEdge[];
+}
 interface Snapshot {
   version: VersionInfo; root: string; files: RawSourceFile[]; nodes: RawAstNode[];
   symbols: SymbolInfo[]; references: Reference[]; resolutions: RawResolution[];
   types: TypeInfo[]; nodeTypes: RawNodeType[]; constantValues: RawSymbolConstantValue[];
-  callGraph: CallEdge[]; diagnostics: Diagnostic[];
+  controlFlowGraphs: RawControlFlowGraph[]; callGraph: CallEdge[]; diagnostics: Diagnostic[];
 }
 
 export class AstNode {
@@ -217,6 +249,93 @@ export class SourceFile {
   }
 }
 
+type ControlFlowNodeLike = ControlFlowNodeId | ControlFlowNode;
+
+export class ControlFlowGraph {
+  readonly symbolId: SymbolId;
+  readonly entry: ControlFlowNodeId;
+  readonly exit: ControlFlowNodeId;
+  readonly nodes: readonly ControlFlowNode[];
+  readonly edges: readonly ControlFlowEdge[];
+  readonly #nodes = new Map<ControlFlowNodeId, ControlFlowNode>();
+  readonly #successors = new Map<ControlFlowNodeId, ControlFlowEdge[]>();
+  readonly #predecessors = new Map<ControlFlowNodeId, ControlFlowEdge[]>();
+
+  /** @internal */
+  constructor(raw: RawControlFlowGraph) {
+    this.symbolId = raw.symbolId;
+    this.entry = raw.entry;
+    this.exit = raw.exit;
+    this.nodes = raw.nodes.map((node) => ({
+      ...node,
+      location: node.location ?? undefined,
+      astNodeId: node.astNodeId ?? undefined,
+    }));
+    this.edges = raw.edges;
+    for (const node of this.nodes) {
+      this.#nodes.set(node.id, node);
+      this.#successors.set(node.id, []);
+      this.#predecessors.set(node.id, []);
+    }
+    for (const edge of this.edges) {
+      this.#successors.get(edge.from)?.push(edge);
+      this.#predecessors.get(edge.to)?.push(edge);
+    }
+  }
+
+  node(id: ControlFlowNodeId): ControlFlowNode | undefined { return this.#nodes.get(id) }
+
+  successors(node: ControlFlowNodeLike): readonly ControlFlowEdge[] {
+    return this.#successors.get(controlFlowNodeId(node)) ?? [];
+  }
+
+  predecessors(node: ControlFlowNodeLike): readonly ControlFlowEdge[] {
+    return this.#predecessors.get(controlFlowNodeId(node)) ?? [];
+  }
+
+  isReachable(node: ControlFlowNodeLike): boolean {
+    return this.#reachableIds(this.entry).has(controlFlowNodeId(node));
+  }
+
+  reachableFrom(node: ControlFlowNodeLike): readonly ControlFlowNode[] {
+    const reachable = this.#reachableIds(controlFlowNodeId(node));
+    return this.nodes.filter((candidate) => reachable.has(candidate.id));
+  }
+
+  dominates(required: ControlFlowNodeLike, target: ControlFlowNodeLike): boolean {
+    const requiredId = controlFlowNodeId(required);
+    const targetId = controlFlowNodeId(target);
+    const reachable = this.#reachableIds(this.entry);
+    if (!reachable.has(requiredId) || !reachable.has(targetId)) return false;
+    if (requiredId === targetId) return true;
+    return !this.#reachableIds(this.entry, requiredId).has(targetId);
+  }
+
+  postDominates(required: ControlFlowNodeLike, origin: ControlFlowNodeLike): boolean {
+    const requiredId = controlFlowNodeId(required);
+    const originId = controlFlowNodeId(origin);
+    if (!this.isReachable(originId) || !this.#reachableIds(originId).has(this.exit)) return false;
+    if (requiredId === originId) return true;
+    return !this.#reachableIds(originId, requiredId).has(this.exit);
+  }
+
+  #reachableIds(start: ControlFlowNodeId, blocked?: ControlFlowNodeId): Set<ControlFlowNodeId> {
+    const reachable = new Set<ControlFlowNodeId>();
+    if (!this.#nodes.has(start) || start === blocked) return reachable;
+    const queue = [start];
+    reachable.add(start);
+    for (let index = 0; index < queue.length; index++) {
+      for (const edge of this.#successors.get(queue[index]) ?? []) {
+        if (edge.to !== blocked && !reachable.has(edge.to)) {
+          reachable.add(edge.to);
+          queue.push(edge.to);
+        }
+      }
+    }
+    return reachable;
+  }
+}
+
 export class InspectedProject {
   readonly root: string;
   readonly version: VersionInfo;
@@ -229,6 +348,7 @@ export class InspectedProject {
   #resolutionByNode = new Map<NodeId, RawResolution>();
   #typeByNode = new Map<NodeId, TypeInfo>();
   #constantBySymbol = new Map<SymbolId, ConstantValue>();
+  #controlFlowBySymbol = new Map<SymbolId, ControlFlowGraph>();
   #references: readonly Reference[];
   #calls: readonly CallEdge[];
   #diagnostics: readonly Diagnostic[];
@@ -260,6 +380,10 @@ export class InspectedProject {
       if (type) this.#typeByNode.set(relation.nodeId, type);
     }
     for (const constant of snapshot.constantValues) this.#constantBySymbol.set(constant.symbolId, constant.value);
+    for (const raw of snapshot.controlFlowGraphs) {
+      const graph = new ControlFlowGraph(raw);
+      this.#controlFlowBySymbol.set(graph.symbolId, graph);
+    }
     this.#references = snapshot.references.map((item) => ({ ...item, symbolId: item.symbolId ?? undefined, nodeId: item.nodeId ?? undefined }));
     this.#calls = snapshot.callGraph.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
     this.#diagnostics = snapshot.diagnostics.map((item) => ({ ...item, code: item.code ?? undefined, location: item.location ?? undefined }));
@@ -317,6 +441,15 @@ export class InspectedProject {
     return this.#constantBySymbol.get(id);
   }
 
+  controlFlow(symbol: SymbolId | SymbolInfo): ControlFlowGraph | undefined {
+    this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
+    return this.#controlFlowBySymbol.get(id);
+  }
+
+  controlFlowGraphs(): readonly ControlFlowGraph[] {
+    this.#active(); return [...this.#controlFlowBySymbol.values()];
+  }
+
   callGraph(): readonly CallEdge[] { this.#active(); return this.#calls }
   calls(symbol: SymbolId | SymbolInfo): readonly CallEdge[] {
     this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
@@ -333,6 +466,7 @@ export class InspectedProject {
     this.#nodes.clear(); this.#files.clear(); this.#symbols.clear(); this.#types.clear();
     this.#symbolByNode.clear(); this.#resolutionByNode.clear(); this.#typeByNode.clear();
     this.#constantBySymbol.clear();
+    this.#controlFlowBySymbol.clear();
     this.#references = []; this.#calls = []; this.#diagnostics = [];
   }
 
@@ -348,6 +482,7 @@ export async function inspectProject(input: ProjectInput): Promise<InspectedProj
     ...(input.stdlibRoot === undefined ? {} : { stdlibRoot: input.stdlibRoot }),
     ...(input.actonStdlibRoot === undefined ? {} : { actonStdlibRoot: input.actonStdlibRoot }),
     importMappings: { ...(input.importMappings ?? {}) },
+    controlFlow: input.controlFlow ?? "workspace",
   };
   return new InspectedProject(wasm.inspectProjectSnapshot(wireInput) as Snapshot);
 }
@@ -355,6 +490,9 @@ export async function inspectProject(input: ProjectInput): Promise<InspectedProj
 export function versionInfo(): VersionInfo { return wasm.versionInfo() as VersionInfo }
 
 function isDefined<T>(value: T | undefined): value is T { return value !== undefined }
+function controlFlowNodeId(node: ControlFlowNodeLike): ControlFlowNodeId {
+  return typeof node === "string" ? node : node.id;
+}
 function containsPosition(range: SourceRange, position: Position): boolean {
   return comparePosition(range.start, position) <= 0 && comparePosition(position, range.end) <= 0;
 }

@@ -48,8 +48,8 @@ descendant filtering, generic named fields, and conveniences including `name`, `
 `parameters`, `callee`, and `arguments`. Unknown grammar nodes remain visible.
 
 The project facade provides `file`, `node`, `symbols`, `symbol`, `symbolFor`, `symbolAt`,
-`resolve`, `references`, `typeOf`, `constantValue`, `callGraph`, `calls`, `callers`, and
-`diagnostics`.
+`resolve`, `references`, `typeOf`, `constantValue`, `controlFlow`, `controlFlowGraphs`,
+`callGraph`, `calls`, `callers`, and `diagnostics`.
 References include combinable `context.access.read`, `write`, and `mutate` facts computed
 by Acton's `tolk-analysis`, in addition to their syntactic usage and namespace.
 `constantValue` evaluates constant and enum-member symbols; integer values are decimal
@@ -84,3 +84,5 @@ Dependencies use exact Acton Git commit
 `17654feb713c5824ee4cc0259b7be9b5f72898ba`; `Cargo.lock` is committed. The self-contained
 compatibility corpus under `fixtures/upstream/acton-v1.1.0` uses Acton v1.1.0 and its
 matching Tolk 1.4.1 stdlib. See [design and compatibility notes](docs/design.md) for gaps.
+See [control-flow analysis](docs/control-flow.md) for the CFG API, common graph helpers,
+and an authorization-before-mutation audit example.

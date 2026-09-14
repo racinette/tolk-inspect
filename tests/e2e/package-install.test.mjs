@@ -22,6 +22,7 @@ assert.ok(existsSync(join(installed, "dist/index.d.ts")), "tarball omitted decla
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /inspectProject/);
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /ReferenceAccess/);
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /constantValue/);
+assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /controlFlow/);
 
 writeFileSync(join(consumer, "consumer.mjs"), `
   import assert from "node:assert/strict";
@@ -49,6 +50,10 @@ writeFileSync(join(consumer, "consumer.mjs"), `
     value: "7",
     display: "7 (0x7)",
   });
+  const helperCfg = project.controlFlow(helper);
+  assert.ok(helperCfg);
+  assert.equal(helperCfg.isReachable(helperCfg.exit), true);
+  assert.equal(helperCfg.dominates(helperCfg.entry, helperCfg.exit), true);
   assert.equal(versionInfo().actonRevision, "17654feb713c5824ee4cc0259b7be9b5f72898ba");
   console.log("installed-package e2e passed");
 `);

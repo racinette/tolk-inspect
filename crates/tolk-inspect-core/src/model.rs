@@ -4,6 +4,16 @@ use std::collections::BTreeMap;
 pub type NodeId = String;
 pub type SymbolId = String;
 pub type TypeId = String;
+pub type ControlFlowNodeId = String;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ControlFlowScope {
+    None,
+    #[default]
+    Workspace,
+    All,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -16,6 +26,8 @@ pub struct ProjectInput {
     pub acton_stdlib_root: Option<String>,
     #[serde(default)]
     pub import_mappings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub control_flow: ControlFlowScope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +43,7 @@ pub struct ProjectSnapshot {
     pub types: Vec<TypeInfo>,
     pub node_types: Vec<NodeType>,
     pub constant_values: Vec<SymbolConstantValue>,
+    pub control_flow_graphs: Vec<ControlFlowGraph>,
     pub call_graph: Vec<CallEdge>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -178,6 +191,35 @@ pub enum ConstantValue {
     String { value: String, display: String },
     Overflow { display: String },
     Unknown { display: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlFlowGraph {
+    pub symbol_id: SymbolId,
+    pub entry: ControlFlowNodeId,
+    pub exit: ControlFlowNodeId,
+    pub nodes: Vec<ControlFlowNode>,
+    pub edges: Vec<ControlFlowEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlFlowNode {
+    pub id: ControlFlowNodeId,
+    pub kind: String,
+    pub location: Option<SourceLocation>,
+    pub ast_node_id: Option<NodeId>,
+    pub reads: Vec<SymbolId>,
+    pub writes: Vec<SymbolId>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlFlowEdge {
+    pub from: ControlFlowNodeId,
+    pub to: ControlFlowNodeId,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

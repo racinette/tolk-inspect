@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 tolk-analysis.workspace = true
+tolk-dataflow.workspace = true
 tolk-resolver.workspace = true
 tolk-syntax.workspace = true
 tolk-ty.workspace = true

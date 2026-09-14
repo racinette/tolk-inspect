@@ -21,5 +21,7 @@ Resolved references include `context.access` flags for precise read, write, and 
 classification backed by Acton's `tolk-analysis` crate.
 `project.constantValue(symbol)` evaluates constants and enum members, representing integer
 values as exact decimal strings.
+`project.controlFlow(symbol)` returns a navigable per-function CFG with reachability,
+dominance, source-location, AST-link, and local read/write information.
 
 Version 0.1.0 is tested on Node.js 20 and newer.

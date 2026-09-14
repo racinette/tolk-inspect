@@ -10,6 +10,10 @@ use tolk_analysis::{
     AnalysisDb, ConstantEvaluationContext, ConstantEvaluator, ConstantValue as ActonConstantValue,
     UseFlags,
 };
+use tolk_dataflow::{
+    ControlFlowGraph as ActonControlFlowGraph, EdgeKind as ActonEdgeKind,
+    FlowNodeKind as ActonFlowNodeKind,
+};
 use tolk_resolver::{
     FileDb, FileId, NameUse, NameUseKind, ProjectIndex, ProjectSource, ProjectSourceProvider,
     Resolved, Span, Symbol, SymbolKind,
@@ -36,6 +40,7 @@ impl ProjectSourceProvider for MemoryProvider {
 }
 
 pub fn inspect(input: ProjectInput) -> Result<ProjectSnapshot> {
+    let control_flow = input.control_flow;
     let root = normalize_logical_path(Path::new("/"), &input.root)?;
     let stdlib_root = input
         .stdlib_root
@@ -118,7 +123,7 @@ pub fn inspect(input: ProjectInput) -> Result<ProjectSnapshot> {
         .context("failed to construct the Tolk project")?;
     tolk_resolver::resolve(&file_db, &mut project);
 
-    SnapshotBuilder::new(root, &file_db, &project).build()
+    SnapshotBuilder::new(root, &file_db, &project, control_flow).build()
 }
 
 struct SnapshotBuilder<'a> {
@@ -132,10 +137,16 @@ struct SnapshotBuilder<'a> {
     nodes: Vec<AstNode>,
     symbols: Vec<SymbolInfo>,
     diagnostics: Vec<Diagnostic>,
+    control_flow: ControlFlowScope,
 }
 
 impl<'a> SnapshotBuilder<'a> {
-    fn new(root: PathBuf, file_db: &'a FileDb, project: &'a ProjectIndex) -> Self {
+    fn new(
+        root: PathBuf,
+        file_db: &'a FileDb,
+        project: &'a ProjectIndex,
+        control_flow: ControlFlowScope,
+    ) -> Self {
         Self {
             root,
             file_db,
@@ -147,6 +158,7 @@ impl<'a> SnapshotBuilder<'a> {
             nodes: vec![],
             symbols: vec![],
             diagnostics: vec![],
+            control_flow,
         }
     }
 
@@ -265,9 +277,13 @@ impl<'a> SnapshotBuilder<'a> {
             }
             body_types.insert(file.id, bodies);
         }
+        let mut analysis_db = AnalysisDb::new();
+        let control_flow_graphs =
+            self.collect_control_flow_graphs(&mut analysis_db, &type_db, &indexed_files);
         drop(type_db);
 
-        let (references, resolutions, call_graph) = self.collect_references_and_calls(&body_types);
+        let (references, resolutions, call_graph) =
+            self.collect_references_and_calls(&body_types, &mut analysis_db);
         let mut type_builder = TypeBuilder::new(&interner, &self.symbol_ids);
         let mut node_types = Vec::new();
         for (symbol_id, ty) in top_types {
@@ -338,6 +354,7 @@ impl<'a> SnapshotBuilder<'a> {
             types: type_builder.types,
             node_types,
             constant_values,
+            control_flow_graphs,
             call_graph,
             diagnostics: self.diagnostics,
         })
@@ -570,6 +587,7 @@ impl<'a> SnapshotBuilder<'a> {
     fn collect_references_and_calls(
         &mut self,
         bodies: &WorkspaceBodyTypes,
+        analysis_db: &mut AnalysisDb,
     ) -> (Vec<Reference>, Vec<Resolution>, Vec<CallEdge>) {
         let mut uses = BTreeMap::<(FileId, u32, u32, String), &NameUse>::new();
         for (&file_id, index) in self.project.resolved_uses() {
@@ -608,7 +626,6 @@ impl<'a> SnapshotBuilder<'a> {
         let mut references = vec![];
         let mut resolutions = vec![];
         let mut calls = vec![];
-        let mut analysis_db = AnalysisDb::new();
         for ((file_id, _, _, _), usage) in uses {
             let symbol_id = match usage.resolved {
                 Resolved::Global(id) => self.symbol_ids.get(&id).cloned(),
@@ -720,6 +737,110 @@ impl<'a> SnapshotBuilder<'a> {
         }
         values.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
         values
+    }
+
+    fn collect_control_flow_graphs(
+        &self,
+        analysis_db: &mut AnalysisDb,
+        type_db: &TypeDb<'_>,
+        files: &[Arc<tolk_resolver::FileIndex>],
+    ) -> Vec<ControlFlowGraph> {
+        if self.control_flow == ControlFlowScope::None {
+            return vec![];
+        }
+
+        let mut graphs = vec![];
+        for file in files {
+            if self.control_flow == ControlFlowScope::Workspace
+                && !matches!(
+                    file.source_kind,
+                    tolk_resolver::file_index::FileSource::Workspace
+                )
+            {
+                continue;
+            }
+            for symbol in all_global_symbols(&file.decls) {
+                if !matches!(
+                    symbol.kind,
+                    SymbolKind::Function { .. }
+                        | SymbolKind::Method { .. }
+                        | SymbolKind::GetMethod { .. }
+                ) {
+                    continue;
+                }
+                let Some(public_symbol_id) = self.symbol_ids.get(&symbol.id).cloned() else {
+                    continue;
+                };
+                let Some(graph) = analysis_db.cfg_for_symbol(type_db, symbol.id) else {
+                    continue;
+                };
+                graphs.push(self.convert_control_flow_graph(
+                    file.id,
+                    public_symbol_id,
+                    graph.as_ref(),
+                ));
+            }
+        }
+        graphs.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
+        graphs
+    }
+
+    fn convert_control_flow_graph(
+        &self,
+        file_id: FileId,
+        symbol_id: SymbolId,
+        graph: &ActonControlFlowGraph,
+    ) -> ControlFlowGraph {
+        let node_id = |index: usize| format!("cfg:{symbol_id}:n:{index}");
+        let nodes = graph
+            .nodes()
+            .iter()
+            .map(|node| {
+                let mut reads = node
+                    .reads
+                    .iter()
+                    .filter_map(|id| self.local_ids.get(id).cloned())
+                    .collect::<Vec<_>>();
+                reads.sort();
+                let mut writes = node
+                    .writes
+                    .iter()
+                    .filter_map(|id| self.local_ids.get(id).cloned())
+                    .collect::<Vec<_>>();
+                writes.sort();
+                ControlFlowNode {
+                    id: node_id(node.id.index()),
+                    kind: control_flow_node_kind(node.kind).into(),
+                    location: node
+                        .span
+                        .map(|span| self.location(file_id, span.start(), span.end())),
+                    ast_node_id: node.span.and_then(|span| {
+                        self.exact_node(file_id, span)
+                            .or_else(|| self.smallest_node(file_id, span))
+                    }),
+                    reads,
+                    writes,
+                }
+            })
+            .collect();
+        let edges = graph
+            .edges()
+            .iter()
+            .map(|edge| ControlFlowEdge {
+                from: node_id(edge.from.index()),
+                to: node_id(edge.to.index()),
+                kind: control_flow_edge_kind(edge.kind).into(),
+            })
+            .collect();
+        let entry = node_id(graph.entry().index());
+        let exit = node_id(graph.exit().index());
+        ControlFlowGraph {
+            symbol_id,
+            entry,
+            exit,
+            nodes,
+            edges,
+        }
     }
 
     fn call_node(&self, file_id: FileId, span: Span) -> Option<Span> {
@@ -905,6 +1026,38 @@ fn constant_value(value: ActonConstantValue) -> ConstantValue {
     }
 }
 
+const fn control_flow_node_kind(kind: ActonFlowNodeKind) -> &'static str {
+    match kind {
+        ActonFlowNodeKind::Entry => "entry",
+        ActonFlowNodeKind::Exit => "exit",
+        ActonFlowNodeKind::Nop => "nop",
+        ActonFlowNodeKind::Expr => "expression",
+        ActonFlowNodeKind::Condition => "condition",
+        ActonFlowNodeKind::Assert => "assert",
+        ActonFlowNodeKind::Return => "return",
+        ActonFlowNodeKind::Throw => "throw",
+        ActonFlowNodeKind::Break => "break",
+        ActonFlowNodeKind::Continue => "continue",
+        ActonFlowNodeKind::MatchPattern => "matchPattern",
+        ActonFlowNodeKind::CatchBinding => "catchBinding",
+        ActonFlowNodeKind::Join => "join",
+    }
+}
+
+const fn control_flow_edge_kind(kind: ActonEdgeKind) -> &'static str {
+    match kind {
+        ActonEdgeKind::Unconditional => "unconditional",
+        ActonEdgeKind::TrueBranch => "trueBranch",
+        ActonEdgeKind::FalseBranch => "falseBranch",
+        ActonEdgeKind::LoopBack => "loopBack",
+        ActonEdgeKind::Break => "break",
+        ActonEdgeKind::Continue => "continue",
+        ActonEdgeKind::Return => "return",
+        ActonEdgeKind::Throw => "throw",
+        ActonEdgeKind::Exceptional => "exceptional",
+    }
+}
+
 fn normalize_logical_path(root: &Path, value: &str) -> Result<PathBuf> {
     if value.trim().is_empty() {
         bail!("logical paths must not be empty");
@@ -1066,6 +1219,7 @@ mod tests {
             stdlib_root: None,
             acton_stdlib_root: None,
             import_mappings: BTreeMap::new(),
+            control_flow: ControlFlowScope::Workspace,
         })
         .unwrap()
     }
@@ -1223,6 +1377,114 @@ enum Mode {
     }
 
     #[test]
+    fn exposes_control_flow_branches_loops_locations_and_local_accesses() {
+        let source = r#"
+fun flow(x: int): int {
+    var y = x;
+    if (y > 0) {
+        y = y - 1;
+    } else {
+        y = y + 1;
+    }
+    while (y > 0) {
+        y = y - 1;
+    }
+    return y;
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let flow = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "flow")
+            .expect("flow symbol");
+        let y = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == "y" && symbol.containing_symbol.as_ref() == Some(&flow.id)
+            })
+            .expect("local y symbol");
+        let graph = snapshot
+            .control_flow_graphs
+            .iter()
+            .find(|graph| graph.symbol_id == flow.id)
+            .expect("flow CFG");
+
+        assert!(graph.nodes.iter().any(|node| node.id == graph.entry));
+        assert!(graph.nodes.iter().any(|node| node.id == graph.exit));
+        assert!(graph.edges.iter().any(|edge| edge.kind == "trueBranch"));
+        assert!(graph.edges.iter().any(|edge| edge.kind == "falseBranch"));
+        assert!(graph.edges.iter().any(|edge| edge.kind == "loopBack"));
+        assert!(graph.edges.iter().any(|edge| edge.kind == "return"));
+        assert!(graph.nodes.iter().any(|node| node.reads.contains(&y.id)));
+        assert!(graph.nodes.iter().any(|node| node.writes.contains(&y.id)));
+        assert!(graph.nodes.iter().any(|node| {
+            node.kind == "condition" && node.location.is_some() && node.ast_node_id.is_some()
+        }));
+    }
+
+    #[test]
+    fn can_disable_control_flow_generation() {
+        let snapshot = inspect(ProjectInput {
+            root: "/project".into(),
+            files: [("/project/main.tolk".into(), "fun main() {}".into())]
+                .into_iter()
+                .collect(),
+            entrypoints: vec!["/project/main.tolk".into()],
+            stdlib_root: None,
+            acton_stdlib_root: None,
+            import_mappings: BTreeMap::new(),
+            control_flow: ControlFlowScope::None,
+        })
+        .unwrap();
+        assert!(snapshot.control_flow_graphs.is_empty());
+    }
+
+    #[test]
+    fn control_flow_scope_excludes_or_includes_stdlib_graphs() {
+        let input = ProjectInput {
+            root: "/project".into(),
+            files: [
+                ("/project/main.tolk".into(), "fun main() {}".into()),
+                (
+                    "/project/stdlib/common.tolk".into(),
+                    "fun stdlibHelper() {}".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            entrypoints: vec!["/project/main.tolk".into()],
+            stdlib_root: Some("/project/stdlib".into()),
+            acton_stdlib_root: None,
+            import_mappings: BTreeMap::new(),
+            control_flow: ControlFlowScope::Workspace,
+        };
+        let workspace = inspect(input.clone()).unwrap();
+        let all = inspect(ProjectInput {
+            control_flow: ControlFlowScope::All,
+            ..input
+        })
+        .unwrap();
+
+        assert_eq!(workspace.control_flow_graphs.len(), 1);
+        assert_eq!(all.control_flow_graphs.len(), 2);
+        assert!(workspace.control_flow_graphs.iter().all(|graph| {
+            workspace
+                .symbols
+                .iter()
+                .find(|symbol| symbol.id == graph.symbol_id)
+                .is_some_and(|symbol| symbol.name != "stdlibHelper")
+        }));
+        assert!(all.control_flow_graphs.iter().any(|graph| {
+            all.symbols
+                .iter()
+                .find(|symbol| symbol.id == graph.symbol_id)
+                .is_some_and(|symbol| symbol.name == "stdlibHelper")
+        }));
+    }
+
+    #[test]
     fn returns_partial_tree_with_parse_diagnostics() {
         let snapshot = project(
             &[("/project/main.tolk", "fun main( { return 1; }")],
@@ -1308,6 +1570,7 @@ enum Mode {
             stdlib_root: None,
             acton_stdlib_root: None,
             import_mappings: [("pkg".into(), "/vendor".into())].into_iter().collect(),
+            control_flow: ControlFlowScope::Workspace,
         })
         .unwrap();
         assert_eq!(snapshot.files.len(), 2);

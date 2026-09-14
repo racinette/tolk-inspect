@@ -125,3 +125,66 @@ enum Mode {
   assert.equal(project.constantValue(second)?.value, "37");
   assert.equal(project.constantValue("not-a-symbol"), undefined);
 });
+
+test("exposes navigable control flow with reachability and dominance helpers", async () => {
+  const source = `
+fun guarded(mutate balance: int, isOwner: bool, amount: int) {
+  assert (isOwner) throw 401;
+  if (amount > 0) {
+    balance -= amount;
+  }
+}
+
+fun conditionallyGuarded(mutate balance: int, isOwner: bool, amount: int) {
+  if (amount > 0) {
+    assert (isOwner) throw 401;
+  }
+  balance -= amount;
+}`;
+  const project = await inspectProject({
+    root: "/virtual",
+    files: { "/virtual/main.tolk": source },
+  });
+  const guarded = project.symbols().find((symbol) => symbol.name === "guarded");
+  assert.ok(guarded);
+  const balance = project.symbols().find((symbol) =>
+    symbol.name === "balance" && symbol.containingSymbol === guarded.id);
+  assert.ok(balance);
+  const cfg = project.controlFlow(guarded);
+  assert.ok(cfg);
+
+  const check = cfg.nodes.find((node) => node.kind === "assert");
+  const write = cfg.nodes.find((node) => node.writes.includes(balance.id));
+  const condition = cfg.nodes.find((node) => node.kind === "condition");
+  assert.ok(check?.astNodeId && write?.location && condition);
+  assert.equal(project.node(check.astNodeId)?.text.includes("isOwner"), true);
+  assert.equal(cfg.dominates(check, write), true);
+  assert.equal(cfg.postDominates(cfg.exit, cfg.entry), true);
+  assert.equal(cfg.postDominates(write, check), false);
+  assert.equal(cfg.isReachable(write), true);
+  assert.equal(cfg.reachableFrom(cfg.entry).length, cfg.nodes.length);
+  assert.deepEqual(
+    new Set(cfg.successors(condition).map((edge) => edge.kind)),
+    new Set(["trueBranch", "falseBranch"]),
+  );
+  assert.ok(cfg.predecessors(cfg.exit).length > 0);
+  assert.equal(project.controlFlowGraphs().length, 2);
+
+  const conditional = project.symbols().find((symbol) => symbol.name === "conditionallyGuarded");
+  assert.ok(conditional);
+  const conditionalBalance = project.symbols().find((symbol) =>
+    symbol.name === "balance" && symbol.containingSymbol === conditional.id);
+  const conditionalCfg = project.controlFlow(conditional);
+  const conditionalCheck = conditionalCfg?.nodes.find((node) => node.kind === "assert");
+  const conditionalWrite = conditionalCfg?.nodes.find((node) =>
+    conditionalBalance !== undefined && node.writes.includes(conditionalBalance.id));
+  assert.ok(conditionalCfg && conditionalCheck && conditionalWrite);
+  assert.equal(conditionalCfg.dominates(conditionalCheck, conditionalWrite), false);
+
+  const withoutCfg = await inspectProject({
+    root: "/virtual",
+    files: { "/virtual/main.tolk": source },
+    controlFlow: "none",
+  });
+  assert.equal(withoutCfg.controlFlowGraphs().length, 0);
+});

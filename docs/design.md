@@ -21,25 +21,29 @@ explicit UTF-8 byte ranges.
 The core and WASM transport are filesystem-independent. Browser packaging is not claimed
 or tested in 0.1.0; the Node package uses wasm-bindgen's Node target.
 
+## Semantic surfaces
+
+References retain value/type namespace and call context alongside combinable
+read/write/mutate facts from Acton's `tolk-analysis`. `constantValue` evaluates constant
+and enum-member symbols without losing integer precision.
+
+Per-function control-flow graphs retain branch/loop/return/throw edge kinds, source
+locations, AST links, and local read/write sets without leaking Acton's internal IDs.
+They are separate from, and complementary to, the inter-function call graph. Workspace
+CFGs are included by default; consumers can disable them or include dependency graphs.
+See [control-flow analysis](control-flow.md) for the public contract and usage examples.
+
+`TypeInfo` exposes the major type kind, referenced declaration, element types, and
+function return type. Exact constant values belong to `constantValue`; lower-level Acton
+type metadata is deliberately not part of the public contract.
+
 ## Known gaps
 
 - Semantic diagnostics currently include project/import failures and unresolved names;
   Acton's complete compiler diagnostic set is not yet exposed.
-- Reference context distinguishes calls and type/value namespaces. Its combinable
-  read/write/mutate access flags come from Acton's `tolk-analysis` crate.
 - Call sites cover statically resolved direct functions and methods. Calls through
   function-valued locals have no global callee and therefore produce no call edge.
 - The API is snapshot-based; incremental updates require constructing another snapshot.
-- Type structure exposes the major type kind, referenced declaration, element types, and
-  function return type. Literal refinements and every internal Acton type detail are not
-  part of the public contract.
-
-## Planned next semantic surface
-
-Expose Acton's per-function control-flow graphs after the smaller `tolk-analysis`
-facilities. The public graph should retain branch/loop/return/throw edge kinds, source
-locations, and local read/write sets without leaking Acton's internal IDs. This is
-separate from, and complementary to, the existing inter-function call graph.
 
 ## Toolchain note
 
