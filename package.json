@@ -1,0 +1,18 @@
+{
+  "name": "tolk-inspect-monorepo",
+  "private": true,
+  "packageManager": "npm@11.6.2",
+  "workspaces": ["packages/*", "tests/e2e"],
+  "scripts": {
+    "build": "npm run build:wasm && npm run build:ts",
+    "build:wasm": "bash ./scripts/build-wasm.sh",
+    "build:ts": "npm run build --workspace tolk-inspect",
+    "test": "bash ./scripts/test-all.sh",
+    "test:rust": "cargo test --workspace",
+    "test:e2e": "npm run test --workspace tolk-inspect-e2e",
+    "test:compat": "bash ./scripts/test-acton-1.1.sh"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2"
+  }
+}

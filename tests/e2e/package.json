@@ -1,0 +1,8 @@
+{
+  "name": "tolk-inspect-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node ./package-install.test.mjs" }
+}
+

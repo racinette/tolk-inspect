@@ -1,0 +1,6 @@
+/target
+/node_modules
+/packages/tolk-inspect/dist
+/packages/tolk-inspect/generated
+*.tgz
+.DS_Store

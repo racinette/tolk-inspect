@@ -1,0 +1,16 @@
+[package]
+name = "tolk-inspect-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tolk-analysis.workspace = true
+tolk-resolver.workspace = true
+tolk-syntax.workspace = true
+tolk-ty.workspace = true
+tree-sitter.workspace = true
+tree-sitter-language.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "counter"
+description = "A test counter contract"
+version = "0.1.0"
+license = "MIT"
+
+[contracts.counter]
+display-name = "Counter"
+src = "contracts/counter.tolk"
+depends = []

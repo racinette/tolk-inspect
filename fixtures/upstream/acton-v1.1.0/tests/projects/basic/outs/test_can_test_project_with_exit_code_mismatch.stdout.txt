@@ -1,0 +1,16 @@
+   Compiling contracts
+   Compiling Counter
+    Finished in [TIME]
+    Finished in [TIME]
+     Running tests
+
+ TEST  [ROOT]/basic
+
+ > ./tests/counter_test.tolk (2 tests)
+  ✓ should increase counter [TIME]
+  ✗ should reset counter [TIME]
+    └─ Expected exit_code=100, got=0
+
+ ✓ 1 passed, ✗ 1 failed in 1 file
+
+Some tests failed.

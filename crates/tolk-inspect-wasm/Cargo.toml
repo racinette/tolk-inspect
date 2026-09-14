@@ -1,0 +1,17 @@
+[package]
+name = "tolk-inspect-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys.workspace = true
+serde.workspace = true
+serde-wasm-bindgen.workspace = true
+tolk-inspect-core = { path = "../tolk-inspect-core" }
+tree-sitter.workspace = true
+wasm-bindgen.workspace = true

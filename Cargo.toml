@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/tolk-inspect-core", "crates/tolk-inspect-wasm"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+js-sys = "=0.3.105"
+tolk-resolver = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
+tolk-syntax = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
+tolk-ty = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
+tolk-analysis = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
+tree-sitter = "=0.26.12"
+tree-sitter-language = "=0.1.7"
+wasm-bindgen = "=0.2.128"
+serde-wasm-bindgen = "0.6.5"
