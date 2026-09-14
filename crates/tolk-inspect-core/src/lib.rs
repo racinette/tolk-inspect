@@ -14,6 +14,11 @@ use tolk_dataflow::{
     ControlFlowGraph as ActonControlFlowGraph, EdgeKind as ActonEdgeKind,
     FlowNodeKind as ActonFlowNodeKind,
 };
+use tolk_linter::diagnostic::{
+    Applicability as LintApplicability, DiagnosticTag as LintDiagnosticTag,
+    Severity as LintSeverity,
+};
+use tolk_linter::{Checker, RuleSettingsBuilder};
 use tolk_resolver::{
     FileDb, FileId, NameUse, NameUseKind, ProjectIndex, ProjectSource, ProjectSourceProvider,
     Resolved, Span, Symbol, SymbolKind,
@@ -210,6 +215,9 @@ impl<'a> SnapshotBuilder<'a> {
                     ),
                     message: error.message,
                     location: Some(self.location(file.id, start, end)),
+                    help: None,
+                    annotations: vec![],
+                    fixes: vec![],
                 });
             }
 
@@ -228,6 +236,9 @@ impl<'a> SnapshotBuilder<'a> {
                         code: Some("unresolved-import".into()),
                         message: format!("cannot resolve import `{}`", import.import().path),
                         location: Some(location.clone()),
+                        help: None,
+                        annotations: vec![],
+                        fixes: vec![],
                     });
                 }
                 imports.push(ImportInfo {
@@ -280,10 +291,31 @@ impl<'a> SnapshotBuilder<'a> {
         let mut analysis_db = AnalysisDb::new();
         let control_flow_graphs =
             self.collect_control_flow_graphs(&mut analysis_db, &type_db, &indexed_files);
-        drop(type_db);
-
         let (references, resolutions, call_graph) =
             self.collect_references_and_calls(&body_types, &mut analysis_db);
+        drop(type_db);
+        let workspace_file_ids = indexed_files
+            .iter()
+            .filter(|file| file.source_kind == tolk_resolver::file_index::FileSource::Workspace)
+            .map(|file| file.id)
+            .collect::<std::collections::HashSet<_>>();
+        let lint_diagnostics = {
+            let mut lint_interner = interner.clone();
+            let mut lint_type_db = TypeDb::new(&mut lint_interner, self.file_db, self.project);
+            let mut checker = Checker::new(self.file_db, &mut lint_type_db, &body_types)
+                .with_settings(RuleSettingsBuilder::default().build())
+                .with_project_root(self.root.clone());
+            checker.run_once();
+            for file_id in &workspace_file_ids {
+                if let Some(file) = self.file_db.get_by_id(*file_id) {
+                    checker.process_file(file.source(), *file_id);
+                }
+            }
+            checker.apply_suppressions();
+            checker.diagnostics
+        };
+        self.collect_lint_diagnostics(lint_diagnostics, &workspace_file_ids);
+
         let mut type_builder = TypeBuilder::new(&interner, &self.symbol_ids);
         let mut node_types = Vec::new();
         for (symbol_id, ty) in top_types {
@@ -334,6 +366,9 @@ impl<'a> SnapshotBuilder<'a> {
                 code: Some("project-index".into()),
                 message: error.clone(),
                 location: None,
+                help: None,
+                annotations: vec![],
+                fixes: vec![],
             });
         }
         self.diagnostics
@@ -702,6 +737,9 @@ impl<'a> SnapshotBuilder<'a> {
                     code: Some("unresolved-name".into()),
                     message: format!("unresolved {} name `{}`", namespace, usage.name),
                     location: Some(self.location(file_id, usage.span.start(), usage.span.end())),
+                    help: None,
+                    annotations: vec![],
+                    fixes: vec![],
                 });
             }
         }
@@ -711,6 +749,95 @@ impl<'a> SnapshotBuilder<'a> {
         calls.sort_by(|a, b| call_key(a).cmp(&call_key(b)));
         calls.dedup_by(|a, b| call_key(a) == call_key(b));
         (references, resolutions, calls)
+    }
+
+    fn collect_lint_diagnostics(
+        &mut self,
+        diagnostics: Vec<tolk_linter::diagnostic::Diagnostic>,
+        workspace_file_ids: &std::collections::HashSet<FileId>,
+    ) {
+        let converted = diagnostics
+            .into_iter()
+            .filter(|diagnostic| workspace_file_ids.contains(&diagnostic.file_id))
+            .map(|diagnostic| {
+                let location = diagnostic
+                    .annotations
+                    .iter()
+                    .find(|annotation| annotation.is_primary)
+                    .or_else(|| diagnostic.annotations.first())
+                    .map(|annotation| {
+                        self.location(
+                            diagnostic.file_id,
+                            annotation.span.start(),
+                            annotation.span.end(),
+                        )
+                    });
+                let annotations = diagnostic
+                    .annotations
+                    .into_iter()
+                    .map(|annotation| DiagnosticAnnotation {
+                        location: self.location(
+                            diagnostic.file_id,
+                            annotation.span.start(),
+                            annotation.span.end(),
+                        ),
+                        message: annotation.message,
+                        primary: annotation.is_primary,
+                        tags: annotation
+                            .tags
+                            .into_iter()
+                            .map(|tag| match tag {
+                                LintDiagnosticTag::Unnecessary => "unnecessary",
+                                LintDiagnosticTag::Deprecated => "deprecated",
+                            })
+                            .map(str::to_owned)
+                            .collect(),
+                    })
+                    .collect();
+                let fixes = diagnostic
+                    .fixes
+                    .into_iter()
+                    .map(|fix| DiagnosticFix {
+                        message: fix.message,
+                        applicability: match fix.applicability {
+                            LintApplicability::Auto => "automatic",
+                            LintApplicability::Manual => "manual",
+                        }
+                        .into(),
+                        edits: fix
+                            .edits
+                            .into_iter()
+                            .map(|edit| DiagnosticEdit {
+                                location: self.location(
+                                    edit.file_id,
+                                    edit.span.start(),
+                                    edit.span.end(),
+                                ),
+                                replacement: edit.replacement,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                Diagnostic {
+                    phase: "lint".into(),
+                    source: "tolk-linter".into(),
+                    severity: match diagnostic.severity {
+                        LintSeverity::Fatal | LintSeverity::Error => "error",
+                        LintSeverity::Warning => "warning",
+                        LintSeverity::Info => "information",
+                        LintSeverity::Help => "hint",
+                    }
+                    .into(),
+                    code: diagnostic.code,
+                    message: diagnostic.message,
+                    location,
+                    help: diagnostic.help,
+                    annotations,
+                    fixes,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.diagnostics.extend(converted);
     }
 
     fn collect_constant_values(
@@ -1551,6 +1678,73 @@ fun flow(x: int): int {
             .unwrap();
         assert_eq!(location.range.start.line, 0);
         assert!(location.byte_range.start > location.range.start.character);
+    }
+
+    #[test]
+    fn exposes_linter_diagnostics_annotations_and_fixes() {
+        let source = "fun main() {\n    val unused = 1;\n}";
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let diagnostic = snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_deref() == Some("E001"))
+            .expect("unused variable diagnostic");
+
+        assert_eq!(diagnostic.phase, "lint");
+        assert_eq!(diagnostic.source, "tolk-linter");
+        assert_eq!(diagnostic.severity, "warning");
+        assert_eq!(
+            diagnostic
+                .location
+                .as_ref()
+                .map(|location| location.path.as_str()),
+            Some("/project/main.tolk")
+        );
+        assert!(diagnostic.annotations.iter().any(|annotation| {
+            annotation.primary
+                && annotation.tags.iter().any(|tag| tag == "unnecessary")
+                && annotation.message.as_deref() == Some("unused variable `unused`")
+        }));
+        assert!(diagnostic.fixes.iter().any(|fix| {
+            fix.applicability == "automatic"
+                && fix.edits.iter().any(|edit| {
+                    edit.replacement == "_unused" && edit.location.path == "/project/main.tolk"
+                })
+        }));
+    }
+
+    #[test]
+    fn honors_linter_suppressions_and_does_not_lint_dependencies() {
+        let snapshot = inspect(ProjectInput {
+            root: "/project".into(),
+            files: [
+                (
+                    "/project/main.tolk".into(),
+                    "fun main() {\n    // check-disable-next-line unused-variable\n    val localUnused = 1;\n}"
+                        .into(),
+                ),
+                (
+                    "/project/stdlib/common.tolk".into(),
+                    "fun helper() { val dependencyUnused = 1; }".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            entrypoints: vec!["/project/main.tolk".into()],
+            stdlib_root: Some("/project/stdlib".into()),
+            acton_stdlib_root: None,
+            import_mappings: BTreeMap::new(),
+            control_flow: ControlFlowScope::Workspace,
+        })
+        .unwrap();
+
+        assert!(!snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("E001")
+                && diagnostic.location.as_ref().is_some_and(|location| {
+                    location.path == "/project/main.tolk"
+                        || location.path == "/project/stdlib/common.tolk"
+                })
+        }));
     }
 
     #[test]

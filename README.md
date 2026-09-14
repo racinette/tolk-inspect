@@ -50,6 +50,23 @@ descendant filtering, generic named fields, and conveniences including `name`, `
 The project facade provides `file`, `node`, `symbols`, `symbol`, `symbolFor`, `symbolAt`,
 `resolve`, `references`, `typeOf`, `constantValue`, `controlFlow`, `controlFlowGraphs`,
 `callGraph`, `calls`, `callers`, and `diagnostics`.
+Diagnostics include Acton linter findings for workspace files, including rule codes,
+secondary annotations, help text, and structured automatic or manual fixes.
+
+```ts
+for (const diagnostic of project.diagnostics()) {
+  console.log(diagnostic.code, diagnostic.message, diagnostic.location);
+
+  for (const fix of diagnostic.fixes) {
+    console.log(fix.applicability, fix.message, fix.edits);
+  }
+}
+```
+
+The linter uses Acton's default rule settings and honors
+`// check-disable-next-line rule-name`. Standard-library and Acton dependency files are
+not linted.
+
 References include combinable `context.access.read`, `write`, and `mutate` facts computed
 by Acton's `tolk-analysis`, in addition to their syntactic usage and namespace.
 `constantValue` evaluates constant and enum-member symbols; integer values are decimal

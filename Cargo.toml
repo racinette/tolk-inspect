@@ -18,6 +18,7 @@ tolk-syntax = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb
 tolk-ty = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
 tolk-analysis = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
 tolk-dataflow = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
+tolk-linter = { git = "https://github.com/ton-blockchain/acton", rev = "17654feb713c5824ee4cc0259b7be9b5f72898ba" }
 tree-sitter = "=0.26.12"
 tree-sitter-language = "=0.1.7"
 wasm-bindgen = "=0.2.128"

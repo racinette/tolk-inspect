@@ -37,10 +37,14 @@ See [control-flow analysis](control-flow.md) for the public contract and usage e
 function return type. Exact constant values belong to `constantValue`; lower-level Acton
 type metadata is deliberately not part of the public contract.
 
+Workspace diagnostics include Acton's linter findings with rule codes, severities,
+annotations, help text, and structured fixes. Native `check-disable-next-line`
+suppressions are honored. Dependency sources remain inspectable but are not linted.
+
 ## Known gaps
 
-- Semantic diagnostics currently include project/import failures and unresolved names;
-  Acton's complete compiler diagnostic set is not yet exposed.
+- Official C++ compiler diagnostics require a separate compiler backend and are not
+  available in the current WASM build.
 - Call sites cover statically resolved direct functions and methods. Calls through
   function-valued locals have no global callee and therefore produce no call edge.
 - The API is snapshot-based; incremental updates require constructing another snapshot.

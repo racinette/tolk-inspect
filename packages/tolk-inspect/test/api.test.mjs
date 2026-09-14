@@ -43,6 +43,26 @@ test("reports the exact analyzer revision", () => {
   });
 });
 
+test("exposes Acton linter diagnostics with structured fixes", async () => {
+  const project = await inspectProject({
+    root: "/virtual",
+    files: {
+      "/virtual/main.tolk": "fun main() {\n  val unused = 1;\n}",
+    },
+  });
+  const diagnostic = project.diagnostics().find((item) => item.code === "E001");
+  assert.ok(diagnostic);
+  assert.equal(diagnostic.phase, "lint");
+  assert.equal(diagnostic.source, "tolk-linter");
+  assert.equal(diagnostic.location?.path, "/virtual/main.tolk");
+  assert.equal(diagnostic.help, undefined);
+  assert.ok(diagnostic.annotations.some((annotation) =>
+    annotation.primary && annotation.tags.includes("unnecessary")));
+  assert.ok(diagnostic.fixes.some((fix) =>
+    fix.applicability === "automatic"
+      && fix.edits.some((edit) => edit.replacement === "_unused")));
+});
+
 test("exposes combinable read, write, and mutate reference facts", async () => {
   const project = await inspectProject({
     root: "/virtual",

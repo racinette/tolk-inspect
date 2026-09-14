@@ -240,6 +240,33 @@ pub struct Diagnostic {
     pub code: Option<String>,
     pub message: String,
     pub location: Option<SourceLocation>,
+    pub help: Option<String>,
+    pub annotations: Vec<DiagnosticAnnotation>,
+    pub fixes: Vec<DiagnosticFix>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAnnotation {
+    pub location: SourceLocation,
+    pub message: Option<String>,
+    pub primary: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticFix {
+    pub message: String,
+    pub applicability: String,
+    pub edits: Vec<DiagnosticEdit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticEdit {
+    pub location: SourceLocation,
+    pub replacement: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -131,12 +131,33 @@ export interface CallEdge {
 }
 
 export interface Diagnostic {
-  readonly phase: "parse" | "project" | "resolution" | "type";
+  readonly phase: "parse" | "project" | "resolution" | "type" | "lint";
   readonly source: string;
   readonly severity: "error" | "warning" | "information" | "hint";
   readonly code?: string;
   readonly message: string;
   readonly location?: SourceLocation;
+  readonly help?: string;
+  readonly annotations: readonly DiagnosticAnnotation[];
+  readonly fixes: readonly DiagnosticFix[];
+}
+
+export interface DiagnosticAnnotation {
+  readonly location: SourceLocation;
+  readonly message?: string;
+  readonly primary: boolean;
+  readonly tags: readonly ("unnecessary" | "deprecated")[];
+}
+
+export interface DiagnosticFix {
+  readonly message: string;
+  readonly applicability: "automatic" | "manual";
+  readonly edits: readonly DiagnosticEdit[];
+}
+
+export interface DiagnosticEdit {
+  readonly location: SourceLocation;
+  readonly replacement: string;
 }
 
 export interface ImportInfo {
@@ -386,7 +407,16 @@ export class InspectedProject {
     }
     this.#references = snapshot.references.map((item) => ({ ...item, symbolId: item.symbolId ?? undefined, nodeId: item.nodeId ?? undefined }));
     this.#calls = snapshot.callGraph.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
-    this.#diagnostics = snapshot.diagnostics.map((item) => ({ ...item, code: item.code ?? undefined, location: item.location ?? undefined }));
+    this.#diagnostics = snapshot.diagnostics.map((item) => ({
+      ...item,
+      code: item.code ?? undefined,
+      location: item.location ?? undefined,
+      help: item.help ?? undefined,
+      annotations: item.annotations.map((annotation) => ({
+        ...annotation,
+        message: annotation.message ?? undefined,
+      })),
+    }));
   }
 
   files(): readonly SourceFile[] { this.#active(); return [...this.#files.values()] }

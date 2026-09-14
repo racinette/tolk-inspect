@@ -23,5 +23,8 @@ classification backed by Acton's `tolk-analysis` crate.
 values as exact decimal strings.
 `project.controlFlow(symbol)` returns a navigable per-function CFG with reachability,
 dominance, source-location, AST-link, and local read/write information.
+`project.diagnostics()` includes Acton linter findings for workspace files with rule
+codes, annotations, help text, and structured fixes. Acton
+`check-disable-next-line` comments are honored.
 
 Version 0.1.0 is tested on Node.js 20 and newer.
