@@ -19,5 +19,7 @@ for (const file of project.files()) {
 
 Resolved references include `context.access` flags for precise read, write, and mutation
 classification backed by Acton's `tolk-analysis` crate.
+`project.constantValue(symbol)` evaluates constants and enum members, representing integer
+values as exact decimal strings.
 
 Version 0.1.0 is tested on Node.js 20 and newer.

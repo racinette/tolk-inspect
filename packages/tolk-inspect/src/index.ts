@@ -88,6 +88,13 @@ export interface TypeInfo {
   readonly returnType?: TypeId;
 }
 
+export type ConstantValue =
+  | { readonly kind: "int"; readonly value: string; readonly display: string }
+  | { readonly kind: "bool"; readonly value: boolean; readonly display: string }
+  | { readonly kind: "string"; readonly value: string; readonly display: string }
+  | { readonly kind: "overflow"; readonly display: string }
+  | { readonly kind: "unknown"; readonly display: string };
+
 export interface CallEdge {
   readonly caller: SymbolId;
   readonly callee: SymbolId;
@@ -123,10 +130,12 @@ interface RawSourceFile {
 
 interface RawResolution { nodeId: NodeId; symbolId?: SymbolId; resolved: boolean }
 interface RawNodeType { nodeId: NodeId; typeId: TypeId }
+interface RawSymbolConstantValue { symbolId: SymbolId; value: ConstantValue }
 interface Snapshot {
   version: VersionInfo; root: string; files: RawSourceFile[]; nodes: RawAstNode[];
   symbols: SymbolInfo[]; references: Reference[]; resolutions: RawResolution[];
-  types: TypeInfo[]; nodeTypes: RawNodeType[]; callGraph: CallEdge[]; diagnostics: Diagnostic[];
+  types: TypeInfo[]; nodeTypes: RawNodeType[]; constantValues: RawSymbolConstantValue[];
+  callGraph: CallEdge[]; diagnostics: Diagnostic[];
 }
 
 export class AstNode {
@@ -219,6 +228,7 @@ export class InspectedProject {
   #symbolByNode = new Map<NodeId, SymbolInfo>();
   #resolutionByNode = new Map<NodeId, RawResolution>();
   #typeByNode = new Map<NodeId, TypeInfo>();
+  #constantBySymbol = new Map<SymbolId, ConstantValue>();
   #references: readonly Reference[];
   #calls: readonly CallEdge[];
   #diagnostics: readonly Diagnostic[];
@@ -249,6 +259,7 @@ export class InspectedProject {
       const type = this.#types.get(relation.typeId);
       if (type) this.#typeByNode.set(relation.nodeId, type);
     }
+    for (const constant of snapshot.constantValues) this.#constantBySymbol.set(constant.symbolId, constant.value);
     this.#references = snapshot.references.map((item) => ({ ...item, symbolId: item.symbolId ?? undefined, nodeId: item.nodeId ?? undefined }));
     this.#calls = snapshot.callGraph.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
     this.#diagnostics = snapshot.diagnostics.map((item) => ({ ...item, code: item.code ?? undefined, location: item.location ?? undefined }));
@@ -301,6 +312,11 @@ export class InspectedProject {
     this.#active(); return this.#typeByNode.get(typeof node === "string" ? node : node.id);
   }
 
+  constantValue(symbol: SymbolId | SymbolInfo): ConstantValue | undefined {
+    this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
+    return this.#constantBySymbol.get(id);
+  }
+
   callGraph(): readonly CallEdge[] { this.#active(); return this.#calls }
   calls(symbol: SymbolId | SymbolInfo): readonly CallEdge[] {
     this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
@@ -316,6 +332,7 @@ export class InspectedProject {
     this.#disposed = true;
     this.#nodes.clear(); this.#files.clear(); this.#symbols.clear(); this.#types.clear();
     this.#symbolByNode.clear(); this.#resolutionByNode.clear(); this.#typeByNode.clear();
+    this.#constantBySymbol.clear();
     this.#references = []; this.#calls = []; this.#diagnostics = [];
   }
 

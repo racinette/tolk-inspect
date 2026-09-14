@@ -30,6 +30,7 @@ pub struct ProjectSnapshot {
     pub resolutions: Vec<Resolution>,
     pub types: Vec<TypeInfo>,
     pub node_types: Vec<NodeType>,
+    pub constant_values: Vec<SymbolConstantValue>,
     pub call_graph: Vec<CallEdge>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -160,6 +161,23 @@ pub struct TypeInfo {
 pub struct NodeType {
     pub node_id: NodeId,
     pub type_id: TypeId,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolConstantValue {
+    pub symbol_id: SymbolId,
+    pub value: ConstantValue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ConstantValue {
+    Int { value: String, display: String },
+    Bool { value: bool, display: String },
+    String { value: String, display: String },
+    Overflow { display: String },
+    Unknown { display: String },
 }
 
 #[derive(Debug, Clone, Serialize)]

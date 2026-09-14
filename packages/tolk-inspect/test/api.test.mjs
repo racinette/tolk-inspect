@@ -83,3 +83,45 @@ fun main() {
       && reference.context.access.write
       && !reference.context.access.mutate));
 });
+
+test("evaluates constants and enum members with exact integers", async () => {
+  const project = await inspectProject({
+    root: "/virtual",
+    files: {
+      "/virtual/main.tolk": `
+const BASE = 10;
+const VALUE = (BASE + 2) * 3;
+const HUGE = 18446744073709551616;
+const ENABLED = true;
+const LABEL = "tolk";
+const TOO_BIG = 1 << 256;
+const NONE = null;
+
+enum Mode {
+  First = VALUE,
+  Second,
+}`,
+    },
+  });
+
+  const value = project.symbols().find((symbol) => symbol.name === "VALUE");
+  const huge = project.symbols().find((symbol) => symbol.name === "HUGE");
+  const enabled = project.symbols().find((symbol) => symbol.name === "ENABLED");
+  const label = project.symbols().find((symbol) => symbol.name === "LABEL");
+  const tooBig = project.symbols().find((symbol) => symbol.name === "TOO_BIG");
+  const none = project.symbols().find((symbol) => symbol.name === "NONE");
+  const second = project.symbols().find((symbol) => symbol.name === "Second");
+  assert.ok(value && huge && enabled && label && tooBig && none && second);
+  assert.deepEqual(project.constantValue(value), {
+    kind: "int",
+    value: "36",
+    display: "36 (0x24)",
+  });
+  assert.equal(project.constantValue(huge)?.value, "18446744073709551616");
+  assert.deepEqual(project.constantValue(enabled), { kind: "bool", value: true, display: "true" });
+  assert.deepEqual(project.constantValue(label), { kind: "string", value: "tolk", display: '"tolk"' });
+  assert.deepEqual(project.constantValue(tooBig), { kind: "overflow", display: "overflow" });
+  assert.deepEqual(project.constantValue(none), { kind: "unknown", display: "unknown" });
+  assert.equal(project.constantValue(second)?.value, "37");
+  assert.equal(project.constantValue("not-a-symbol"), undefined);
+});

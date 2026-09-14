@@ -34,6 +34,13 @@ or tested in 0.1.0; the Node package uses wasm-bindgen's Node target.
   function return type. Literal refinements and every internal Acton type detail are not
   part of the public contract.
 
+## Planned next semantic surface
+
+Expose Acton's per-function control-flow graphs after the smaller `tolk-analysis`
+facilities. The public graph should retain branch/loop/return/throw edge kinds, source
+locations, and local read/write sets without leaking Acton's internal IDs. This is
+separate from, and complementary to, the existing inter-function call graph.
+
 ## Toolchain note
 
 Tree-sitter 0.26's wasm shim must remain on `tree-sitter-language = 0.1.7`; 0.1.8

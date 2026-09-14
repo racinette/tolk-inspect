@@ -48,9 +48,12 @@ descendant filtering, generic named fields, and conveniences including `name`, `
 `parameters`, `callee`, and `arguments`. Unknown grammar nodes remain visible.
 
 The project facade provides `file`, `node`, `symbols`, `symbol`, `symbolFor`, `symbolAt`,
-`resolve`, `references`, `typeOf`, `callGraph`, `calls`, `callers`, and `diagnostics`.
+`resolve`, `references`, `typeOf`, `constantValue`, `callGraph`, `calls`, `callers`, and
+`diagnostics`.
 References include combinable `context.access.read`, `write`, and `mutate` facts computed
 by Acton's `tolk-analysis`, in addition to their syntactic usage and namespace.
+`constantValue` evaluates constant and enum-member symbols; integer values are decimal
+strings so values outside JavaScript's safe-integer range remain exact.
 `versionInfo()` reports the package, pinned Acton revision, and analyzer Tolk version.
 
 ## Build and test

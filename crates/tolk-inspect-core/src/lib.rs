@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tolk_analysis::{AnalysisDb, UseFlags};
+use tolk_analysis::{
+    AnalysisDb, ConstantEvaluationContext, ConstantEvaluator, ConstantValue as ActonConstantValue,
+    UseFlags,
+};
 use tolk_resolver::{
     FileDb, FileId, NameUse, NameUseKind, ProjectIndex, ProjectSource, ProjectSourceProvider,
     Resolved, Span, Symbol, SymbolKind,
@@ -235,6 +238,7 @@ impl<'a> SnapshotBuilder<'a> {
         }
 
         self.collect_symbols(&indexed_files);
+        let constant_values = self.collect_constant_values(&indexed_files);
 
         let mut interner = TypeInterner::new();
         let mut type_db = TypeDb::new(&mut interner, self.file_db, self.project);
@@ -333,6 +337,7 @@ impl<'a> SnapshotBuilder<'a> {
             resolutions,
             types: type_builder.types,
             node_types,
+            constant_values,
             call_graph,
             diagnostics: self.diagnostics,
         })
@@ -691,6 +696,32 @@ impl<'a> SnapshotBuilder<'a> {
         (references, resolutions, calls)
     }
 
+    fn collect_constant_values(
+        &self,
+        files: &[Arc<tolk_resolver::FileIndex>],
+    ) -> Vec<SymbolConstantValue> {
+        let mut evaluator = ConstantEvaluator::new(self);
+        let mut values = vec![];
+        for file in files {
+            for symbol in all_global_symbols(&file.decls) {
+                let evaluated = match symbol.kind {
+                    SymbolKind::Constant => evaluator.evaluate_constant(symbol.id),
+                    SymbolKind::EnumMember => evaluator.evaluate_enum_member(symbol.id),
+                    _ => continue,
+                };
+                let Some(symbol_id) = self.symbol_ids.get(&symbol.id).cloned() else {
+                    continue;
+                };
+                values.push(SymbolConstantValue {
+                    symbol_id,
+                    value: constant_value(evaluated),
+                });
+            }
+        }
+        values.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
+        values
+    }
+
     fn call_node(&self, file_id: FileId, span: Span) -> Option<Span> {
         let info = self.file_db.get_by_id(file_id)?;
         let mut node = info.find_node_at_span(span)?;
@@ -840,6 +871,37 @@ impl<'a> TypeBuilder<'a> {
             return_type,
         });
         id
+    }
+}
+
+impl ConstantEvaluationContext for SnapshotBuilder<'_> {
+    fn file_db(&self) -> &FileDb {
+        self.file_db
+    }
+
+    fn project_index(&self) -> &ProjectIndex {
+        self.project
+    }
+
+    fn resolve_at(&self, file_id: FileId, span: Span) -> Option<Resolved> {
+        self.project
+            .get_resolved_uses(file_id)?
+            .find_use(span.start())
+            .map(|usage| usage.resolved.clone())
+    }
+}
+
+fn constant_value(value: ActonConstantValue) -> ConstantValue {
+    let display = value.format();
+    match value {
+        ActonConstantValue::Int(value) => ConstantValue::Int {
+            value: value.to_string(),
+            display,
+        },
+        ActonConstantValue::Bool(value) => ConstantValue::Bool { value, display },
+        ActonConstantValue::String(value) => ConstantValue::String { value, display },
+        ActonConstantValue::Overflow => ConstantValue::Overflow { display },
+        ActonConstantValue::Unknown => ConstantValue::Unknown { display },
     }
 }
 
@@ -1096,6 +1158,68 @@ fun main() {
         assert!(!write.context.access.read);
         assert!(write.context.access.write);
         assert!(!write.context.access.mutate);
+    }
+
+    #[test]
+    fn evaluates_constants_and_enum_members_without_losing_integer_precision() {
+        let source = r#"
+const BASE = 10;
+const VALUE = (BASE + 2) * 3;
+const HUGE = 18446744073709551616;
+const ENABLED = true;
+const LABEL = "tolk";
+const TOO_BIG = 1 << 256;
+const NONE = null;
+
+enum Mode {
+    First = VALUE,
+    Second,
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let value_for = |name: &str| {
+            let symbol = snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .expect("expected symbol");
+            &snapshot
+                .constant_values
+                .iter()
+                .find(|constant| constant.symbol_id == symbol.id)
+                .expect("expected evaluated value")
+                .value
+        };
+
+        assert!(matches!(
+            value_for("VALUE"),
+            ConstantValue::Int { value, .. } if value == "36"
+        ));
+        assert!(matches!(
+            value_for("HUGE"),
+            ConstantValue::Int { value, .. } if value == "18446744073709551616"
+        ));
+        assert!(matches!(
+            value_for("First"),
+            ConstantValue::Int { value, .. } if value == "36"
+        ));
+        assert!(matches!(
+            value_for("Second"),
+            ConstantValue::Int { value, .. } if value == "37"
+        ));
+        assert!(matches!(
+            value_for("ENABLED"),
+            ConstantValue::Bool { value: true, .. }
+        ));
+        assert!(matches!(
+            value_for("LABEL"),
+            ConstantValue::String { value, .. } if value == "tolk"
+        ));
+        assert!(matches!(
+            value_for("TOO_BIG"),
+            ConstantValue::Overflow { .. }
+        ));
+        assert!(matches!(value_for("NONE"), ConstantValue::Unknown { .. }));
     }
 
     #[test]

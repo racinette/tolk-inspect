@@ -21,6 +21,7 @@ assert.ok(existsSync(join(installed, "generated/tolk_inspect_wasm_bg.wasm")), "t
 assert.ok(existsSync(join(installed, "dist/index.d.ts")), "tarball omitted declarations");
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /inspectProject/);
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /ReferenceAccess/);
+assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /constantValue/);
 
 writeFileSync(join(consumer, "consumer.mjs"), `
   import assert from "node:assert/strict";
@@ -29,7 +30,7 @@ writeFileSync(join(consumer, "consumer.mjs"), `
     root: "/project",
     files: {
       "/project/main.tolk": 'import "messages";\\nfun main() { helper(); }',
-      "/project/messages.tolk": "fun helper(): int { return 7; }"
+      "/project/messages.tolk": "const ANSWER = 7; fun helper(): int { return ANSWER; }"
     },
     entrypoints: ["/project/main.tolk"]
   });
@@ -41,6 +42,12 @@ writeFileSync(join(consumer, "consumer.mjs"), `
     read: true,
     write: false,
     mutate: false,
+  });
+  const answer = project.symbols().find((symbol) => symbol.name === "ANSWER");
+  assert.deepEqual(project.constantValue(answer), {
+    kind: "int",
+    value: "7",
+    display: "7 (0x7)",
   });
   assert.equal(versionInfo().actonRevision, "17654feb713c5824ee4cc0259b7be9b5f72898ba");
   console.log("installed-package e2e passed");
