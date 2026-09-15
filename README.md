@@ -94,6 +94,10 @@ An indirect call can be complete with one or several targets, partially resolved
 known targets plus `complete: false`, or wholly unknown with no targets and
 `complete: false`. Indirect analysis runs even when `controlFlow: "none"`; that option
 controls the public CFG payload, not call-graph precision.
+
+Callable flow includes standard array/map storage and lookup. Constant indexes and keys stay
+precise; dynamic lookups produce a safe union of possible targets. Collection mutations are
+tracked through branches, loops, returns, and `mutate` helper parameters.
 `versionInfo()` reports the package, pinned Acton revision, and analyzer Tolk version.
 
 ## Build and test

@@ -26,8 +26,9 @@ dominance, source-location, AST-link, and local read/write information.
 `project.callSites()` exposes direct and indirect calls, possible global targets, and
 whether target resolution is complete. Whole-program callable flow crosses copies,
 branches, loops, callback parameters, function returns, recursion, lambdas, and nested
-tuple/object fields. Lambda symbols own their internal call sites and CFGs, with callback
-captures modeled at creation time.
+tuple/object fields. Standard array/map storage, lookup, and mutation are also tracked,
+including constant and dynamic keys. Lambda symbols own their internal call sites and CFGs,
+with callback captures modeled at creation time.
 `project.diagnostics()` includes Acton linter findings for workspace files with rule
 codes, annotations, help text, and structured fixes. Acton
 `check-disable-next-line` comments are honored.

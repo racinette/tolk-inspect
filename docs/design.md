@@ -49,9 +49,8 @@ suppressions are honored. Dependency sources remain inspectable but are not lint
 
 - Official C++ compiler diagnostics require a separate compiler backend and are not
   available in the current WASM build.
-- Callable flow is context-insensitive, so separate calls to one helper merge their
-  possible targets. Externally supplied callbacks and values produced by opaque runtime,
-  builtin, array, or map operations remain incomplete.
+- Externally supplied callbacks and values produced by opaque runtime or unmodeled builtin
+  operations remain incomplete.
 - The API is snapshot-based; incremental updates require constructing another snapshot.
 
 ## Toolchain note

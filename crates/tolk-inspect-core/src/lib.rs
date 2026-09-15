@@ -33,8 +33,21 @@ type ResolutionsBySpan = HashMap<(FileId, u32, u32), Resolved>;
 type CallableState = HashMap<tolk_resolver::resolve_index::LocalDefId, CallableValue>;
 type ParameterValues = HashMap<SymbolId, Vec<Option<CallableValue>>>;
 type ReturnValues = HashMap<SymbolId, CallableValue>;
+type MutationValues = HashMap<SymbolId, Vec<Option<CallableValue>>>;
 type CaptureValues =
     HashMap<SymbolId, HashMap<tolk_resolver::resolve_index::LocalDefId, CallableValue>>;
+type CollectionKinds = HashMap<(FileId, u32, u32), CollectionKind>;
+type ConstantKeys = HashMap<tolk_resolver::SymbolId, String>;
+
+const DYNAMIC_MEMBER: &str = "\0dynamic";
+const MAP_VALUE_MEMBER: &str = "\0map-value";
+const MAX_TRACKED_ARRAY_LENGTHS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionKind {
+    Array,
+    Map,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CallableValue {
@@ -42,6 +55,7 @@ struct CallableValue {
     complete: bool,
     members: BTreeMap<String, CallableValue>,
     members_complete: bool,
+    array_lengths: Option<BTreeSet<usize>>,
     bottom: bool,
 }
 
@@ -74,13 +88,65 @@ impl CallableValue {
         if self.bottom {
             return Self::bottom();
         }
-        self.members.get(key).cloned().unwrap_or_else(|| {
+        let exact = self.members.get(key).cloned().unwrap_or_else(|| {
             if self.members_complete {
                 Self::non_callable()
             } else {
                 Self::default()
             }
-        })
+        });
+        self.members
+            .get(DYNAMIC_MEMBER)
+            .map_or(exact.clone(), |dynamic| {
+                merged_callable_value(&exact, dynamic)
+            })
+    }
+
+    fn any_member(&self) -> Self {
+        if self.bottom {
+            return Self::bottom();
+        }
+        let mut result = if self.members_complete {
+            Self::non_callable()
+        } else {
+            Self::default()
+        };
+        for value in self.members.values() {
+            result = merged_callable_value(&result, value);
+        }
+        result
+    }
+
+    fn set_dynamic_member(&mut self, value: Self) {
+        let current = self
+            .members
+            .entry(DYNAMIC_MEMBER.into())
+            .or_insert_with(Self::bottom);
+        *current = merged_callable_value(current, &value);
+    }
+
+    fn push_array_member(&mut self, value: Self) {
+        let Some(lengths) = self.array_lengths.clone() else {
+            self.set_dynamic_member(value);
+            return;
+        };
+        for length in &lengths {
+            let current = self
+                .members
+                .entry(format!("int:{length}"))
+                .or_insert_with(Self::bottom);
+            *current = merged_callable_value(current, &value);
+        }
+        let next_lengths = lengths
+            .into_iter()
+            .map(|length| length.saturating_add(1))
+            .collect::<BTreeSet<_>>();
+        if next_lengths.len() > MAX_TRACKED_ARRAY_LENGTHS {
+            self.array_lengths = None;
+            self.set_dynamic_member(value);
+        } else {
+            self.array_lengths = Some(next_lengths);
+        }
     }
 
     fn set_member_path(&mut self, path: &[String], value: Self) {
@@ -108,6 +174,7 @@ impl CallableValue {
         if remaining == 0 {
             self.members.clear();
             self.members_complete = false;
+            self.array_lengths = None;
             return;
         }
         for member in self.members.values_mut() {
@@ -135,6 +202,7 @@ struct CallableDefinition {
     acton_symbol: Option<tolk_resolver::SymbolId>,
     graph: Arc<ActonControlFlowGraph>,
     parameters: Vec<tolk_resolver::resolve_index::LocalDefId>,
+    mutable_parameters: Vec<bool>,
     captures: Vec<tolk_resolver::resolve_index::LocalDefId>,
 }
 
@@ -151,6 +219,7 @@ struct ProgramAnalysis {
     call_sites: Vec<CallSite>,
     parameters: ParameterValues,
     returns: ReturnValues,
+    mutations: MutationValues,
     captures: CaptureValues,
 }
 
@@ -311,6 +380,8 @@ struct SnapshotBuilder<'a> {
     symbols: Vec<SymbolInfo>,
     diagnostics: Vec<Diagnostic>,
     control_flow: ControlFlowScope,
+    collection_kinds: CollectionKinds,
+    constant_keys: ConstantKeys,
 }
 
 impl<'a> SnapshotBuilder<'a> {
@@ -333,6 +404,8 @@ impl<'a> SnapshotBuilder<'a> {
             symbols: vec![],
             diagnostics: vec![],
             control_flow,
+            collection_kinds: CollectionKinds::new(),
+            constant_keys: ConstantKeys::new(),
         }
     }
 
@@ -458,6 +531,8 @@ impl<'a> SnapshotBuilder<'a> {
             }
             body_types.insert(file.id, bodies);
         }
+        self.collection_kinds = collection_kinds(&body_types, &type_db);
+        self.constant_keys = self.collect_constant_keys(&indexed_files);
         let mut analysis_db = AnalysisDb::new();
         let control_flow_graphs =
             self.collect_control_flow_graphs(&mut analysis_db, &type_db, &indexed_files);
@@ -1133,13 +1208,18 @@ impl<'a> SnapshotBuilder<'a> {
                 let Some(declaration) = info.find_syntax_declaration(symbol.id) else {
                     continue;
                 };
+                let parameters = self.callable_parameters(file.id, declaration.syntax());
+                let mut mutable_parameters =
+                    self.callable_parameter_mutability(file.id, declaration.syntax());
+                mutable_parameters.resize(parameters.len(), false);
                 definitions.insert(
                     self.symbol_ids[&symbol.id].clone(),
                     CallableDefinition {
                         file_id: file.id,
                         acton_symbol: Some(symbol.id),
                         graph,
-                        parameters: self.callable_parameters(file.id, declaration.syntax()),
+                        parameters,
+                        mutable_parameters,
                         captures: vec![],
                     },
                 );
@@ -1163,6 +1243,7 @@ impl<'a> SnapshotBuilder<'a> {
                     acton_symbol: None,
                     graph,
                     parameters: self.callable_parameters(file_id, node),
+                    mutable_parameters: self.callable_parameter_mutability(file_id, node),
                     captures: self.lambda_captures(file_id, span),
                 },
             );
@@ -1192,6 +1273,20 @@ impl<'a> SnapshotBuilder<'a> {
             }
         }
         result
+    }
+
+    fn callable_parameter_mutability(&self, file_id: FileId, declaration: Node<'_>) -> Vec<bool> {
+        let Some(parameters) = declaration.child_by_field_name("parameters") else {
+            return vec![];
+        };
+        let mut cursor = parameters.walk();
+        parameters
+            .named_children(&mut cursor)
+            .map(|parameter| {
+                self.node_text(file_id, parameter)
+                    .is_some_and(|text| text.trim_start().starts_with("mutate "))
+            })
+            .collect()
     }
 
     fn lambda_captures(
@@ -1256,6 +1351,19 @@ impl<'a> SnapshotBuilder<'a> {
             .keys()
             .map(|symbol| (symbol.clone(), CallableValue::bottom()))
             .collect::<ReturnValues>();
+        let mut mutations = definitions
+            .iter()
+            .map(|(symbol, definition)| {
+                (
+                    symbol.clone(),
+                    definition
+                        .mutable_parameters
+                        .iter()
+                        .map(|is_mutable| is_mutable.then(CallableValue::bottom))
+                        .collect(),
+                )
+            })
+            .collect::<MutationValues>();
         let mut call_sites = vec![];
         let max_iterations = definitions.len().saturating_mul(4).max(8);
 
@@ -1266,15 +1374,18 @@ impl<'a> SnapshotBuilder<'a> {
                 &definitions,
                 &parameters,
                 &returns,
+                &mutations,
                 &captures,
                 lambda_creations,
                 false,
             );
             let stable = analysis.parameters == parameters
                 && analysis.returns == returns
+                && analysis.mutations == mutations
                 && analysis.captures == captures;
             parameters = analysis.parameters;
             returns = analysis.returns;
+            mutations = analysis.mutations;
             captures = analysis.captures;
             call_sites = analysis.call_sites;
             if stable {
@@ -1291,15 +1402,18 @@ impl<'a> SnapshotBuilder<'a> {
                 &definitions,
                 &parameters,
                 &returns,
+                &mutations,
                 &captures,
                 lambda_creations,
                 true,
             );
             let stable = analysis.parameters == parameters
                 && analysis.returns == returns
+                && analysis.mutations == mutations
                 && analysis.captures == captures;
             parameters = analysis.parameters;
             returns = analysis.returns;
+            mutations = analysis.mutations;
             captures = analysis.captures;
             call_sites = analysis.call_sites;
             if stable {
@@ -1317,6 +1431,7 @@ impl<'a> SnapshotBuilder<'a> {
         definitions: &BTreeMap<SymbolId, CallableDefinition>,
         parameter_values: &ParameterValues,
         return_values: &ReturnValues,
+        mutation_values: &MutationValues,
         capture_values: &CaptureValues,
         lambda_creations: &[LambdaCreation],
         external_unknown: bool,
@@ -1325,6 +1440,15 @@ impl<'a> SnapshotBuilder<'a> {
             parameters: definitions
                 .iter()
                 .map(|(id, definition)| (id.clone(), vec![None; definition.parameters.len()]))
+                .collect(),
+            mutations: definitions
+                .iter()
+                .map(|(symbol, definition)| {
+                    (
+                        symbol.clone(),
+                        vec![None; definition.mutable_parameters.len()],
+                    )
+                })
                 .collect(),
             ..Default::default()
         };
@@ -1374,7 +1498,27 @@ impl<'a> SnapshotBuilder<'a> {
                 resolved_by_span,
                 initial,
                 return_values,
+                mutation_values,
             );
+            if let Some(exit_state) = states[graph.exit().index()].as_ref()
+                && let Some(outputs) = result.mutations.get_mut(public_id)
+            {
+                for (index, (&parameter, &is_mutable)) in definition
+                    .parameters
+                    .iter()
+                    .zip(&definition.mutable_parameters)
+                    .enumerate()
+                {
+                    if is_mutable {
+                        outputs[index] = Some(
+                            exit_state
+                                .get(&parameter)
+                                .cloned()
+                                .unwrap_or_else(CallableValue::default),
+                        );
+                    }
+                }
+            }
             result.returns.insert(
                 public_id.clone(),
                 self.callable_return_value(
@@ -1578,6 +1722,7 @@ impl<'a> SnapshotBuilder<'a> {
         resolved_by_span: &ResolutionsBySpan,
         initial: CallableState,
         return_values: &ReturnValues,
+        mutation_values: &MutationValues,
     ) -> Vec<Option<CallableState>> {
         let mut incoming = vec![None; graph.node_count()];
         incoming[graph.entry().index()] = Some(initial);
@@ -1593,6 +1738,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &state,
                 resolved_by_span,
                 return_values,
+                mutation_values,
             );
 
             for edge in graph.successors(node_id) {
@@ -1624,6 +1770,7 @@ impl<'a> SnapshotBuilder<'a> {
         incoming: &CallableState,
         resolved_by_span: &ResolutionsBySpan,
         return_values: &ReturnValues,
+        mutation_values: &MutationValues,
     ) -> CallableState {
         let mut outgoing = incoming.clone();
         let Some(span) = flow_node.span else {
@@ -1646,6 +1793,23 @@ impl<'a> SnapshotBuilder<'a> {
         for local in &flow_node.writes {
             outgoing.insert(*local, CallableValue::default());
         }
+        if let Some(syntax) = syntax {
+            self.apply_collection_mutations(
+                file_id,
+                syntax,
+                &mut outgoing,
+                resolved_by_span,
+                return_values,
+            );
+            self.apply_interprocedural_mutations(
+                file_id,
+                syntax,
+                &mut outgoing,
+                resolved_by_span,
+                return_values,
+                mutation_values,
+            );
+        }
         if let Some((path, value)) = assigned {
             if path.members.is_empty() {
                 outgoing.insert(path.root, value);
@@ -1656,6 +1820,252 @@ impl<'a> SnapshotBuilder<'a> {
             }
         }
         outgoing
+    }
+
+    fn apply_collection_mutations(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        state: &mut CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+    ) {
+        if node.kind() == "lambda_expression" {
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.apply_collection_mutations(file_id, child, state, resolved_by_span, return_values);
+        }
+        if node.kind() != "function_call" {
+            return;
+        }
+        let Some(callee) = node.child_by_field_name("callee") else {
+            return;
+        };
+        let callee = if callee.kind() == "generic_instantiation" {
+            let Some(inner) = callee.child_by_field_name("expr") else {
+                return;
+            };
+            inner
+        } else {
+            callee
+        };
+        if callee.kind() != "dot_access" {
+            return;
+        }
+        let Some(receiver) = callee.child_by_field_name("obj") else {
+            return;
+        };
+        let Some(kind) = self.collection_kind(file_id, receiver) else {
+            return;
+        };
+        let Some(method) = callee
+            .child_by_field_name("field")
+            .and_then(|field| self.node_text(file_id, field))
+        else {
+            return;
+        };
+        let Some(path) = self.local_value_path(file_id, receiver, resolved_by_span) else {
+            return;
+        };
+        let arguments = Self::call_arguments(node);
+        let mut collection =
+            self.callable_value(file_id, receiver, state, resolved_by_span, return_values);
+        let changed = match (kind, method.as_str()) {
+            (CollectionKind::Array, "push") => {
+                let Some(value) = arguments.first() else {
+                    return;
+                };
+                let value =
+                    self.callable_value(file_id, *value, state, resolved_by_span, return_values);
+                collection.push_array_member(value);
+                true
+            }
+            (CollectionKind::Array, "set") => {
+                let (Some(value), Some(index)) = (arguments.first(), arguments.get(1)) else {
+                    return;
+                };
+                let value =
+                    self.callable_value(file_id, *value, state, resolved_by_span, return_values);
+                if let Some(key) = self.collection_key(file_id, *index, resolved_by_span) {
+                    collection.members.insert(key, value);
+                } else {
+                    collection.set_dynamic_member(value);
+                }
+                true
+            }
+            (CollectionKind::Array, "pop") => {
+                if let Some(lengths) = collection.array_lengths.take() {
+                    collection.array_lengths = Some(
+                        lengths
+                            .into_iter()
+                            .map(|length| length.saturating_sub(1))
+                            .collect(),
+                    );
+                }
+                true
+            }
+            (
+                CollectionKind::Map,
+                "set"
+                | "setAndGetPrevious"
+                | "replaceIfExists"
+                | "replaceAndGetPrevious"
+                | "addIfNotExists"
+                | "addOrGetExisting",
+            ) => {
+                let (Some(key), Some(value)) = (arguments.first(), arguments.get(1)) else {
+                    return;
+                };
+                let value =
+                    self.callable_value(file_id, *value, state, resolved_by_span, return_values);
+                if let Some(key) = self.collection_key(file_id, *key, resolved_by_span) {
+                    if method == "set" || method == "setAndGetPrevious" {
+                        collection.members.insert(key, value);
+                    } else {
+                        let current = collection
+                            .members
+                            .entry(key)
+                            .or_insert_with(CallableValue::bottom);
+                        *current = merged_callable_value(current, &value);
+                    }
+                } else {
+                    collection.set_dynamic_member(value);
+                }
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            let mut root = state.get(&path.root).cloned().unwrap_or_default();
+            if path.members.is_empty() {
+                root = collection;
+            } else {
+                root.set_member_path(&path.members, collection);
+            }
+            state.insert(path.root, root);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_interprocedural_mutations(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        state: &mut CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+        mutation_values: &MutationValues,
+    ) {
+        if node.kind() == "lambda_expression" {
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.apply_interprocedural_mutations(
+                file_id,
+                child,
+                state,
+                resolved_by_span,
+                return_values,
+                mutation_values,
+            );
+        }
+        if node.kind() != "function_call" {
+            return;
+        }
+        let Some(callee) = node.child_by_field_name("callee") else {
+            return;
+        };
+        let direct = self.direct_callable_target(file_id, callee, resolved_by_span);
+        let called = direct.map_or_else(
+            || self.callable_value(file_id, callee, state, resolved_by_span, return_values),
+            CallableValue::target,
+        );
+        let arguments = Self::call_arguments(node);
+        let receiver = {
+            let unwrapped = if callee.kind() == "generic_instantiation" {
+                callee.child_by_field_name("expr")
+            } else {
+                Some(callee)
+            };
+            unwrapped
+                .filter(|callee| callee.kind() == "dot_access")
+                .and_then(|callee| callee.child_by_field_name("obj"))
+        };
+        let mut updates = Vec::<(LocalPath, CallableValue)>::new();
+        for target in &called.targets {
+            let Some(outputs) = mutation_values.get(target) else {
+                continue;
+            };
+            let mut actuals = arguments.clone();
+            if outputs.len() == actuals.len().saturating_add(1)
+                && let Some(receiver) = receiver
+            {
+                actuals.insert(0, receiver);
+            }
+            for (actual, output) in actuals.into_iter().zip(outputs) {
+                let Some(output) = output else {
+                    continue;
+                };
+                if output.bottom {
+                    continue;
+                }
+                let Some(path) = self.local_value_path(file_id, actual, resolved_by_span) else {
+                    continue;
+                };
+                if let Some((_, current)) = updates.iter_mut().find(|(candidate, _)| {
+                    candidate.root == path.root && candidate.members == path.members
+                }) {
+                    *current = merged_callable_value(current, output);
+                } else {
+                    updates.push((path, output.clone()));
+                }
+            }
+        }
+        for (path, value) in updates {
+            if path.members.is_empty() {
+                state.insert(path.root, value);
+            } else {
+                let mut root = state.get(&path.root).cloned().unwrap_or_default();
+                root.set_member_path(&path.members, value);
+                state.insert(path.root, root);
+            }
+        }
+    }
+
+    fn local_value_path(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        resolved_by_span: &ResolutionsBySpan,
+    ) -> Option<LocalPath> {
+        match node.kind() {
+            "identifier" => match self.resolved_node(file_id, node, resolved_by_span)? {
+                Resolved::Local(root) => Some(LocalPath {
+                    root: *root,
+                    members: vec![],
+                }),
+                Resolved::Global(_) | Resolved::Unresolved => None,
+            },
+            "parenthesized_expression" => self.local_value_path(
+                file_id,
+                node.child_by_field_name("inner")?,
+                resolved_by_span,
+            ),
+            "dot_access" => {
+                let mut path = self.local_value_path(
+                    file_id,
+                    node.child_by_field_name("obj")?,
+                    resolved_by_span,
+                )?;
+                path.members
+                    .push(self.node_text(file_id, node.child_by_field_name("field")?)?);
+                Some(path)
+            }
+            _ => None,
+        }
     }
 
     fn local_assignment_target(
@@ -1714,6 +2124,183 @@ impl<'a> SnapshotBuilder<'a> {
         self.callable_value_depth(file_id, node, state, resolved_by_span, return_values, 0)
     }
 
+    fn collection_kind(&self, file_id: FileId, node: Node<'_>) -> Option<CollectionKind> {
+        self.collection_kinds
+            .get(&(file_id, node.start_byte() as u32, node.end_byte() as u32))
+            .copied()
+    }
+
+    fn collection_key(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        resolved_by_span: &ResolutionsBySpan,
+    ) -> Option<String> {
+        match node.kind() {
+            "number_literal" => {
+                let text = self.node_text(file_id, node)?;
+                let parsed = tolk_syntax::ast::expressions::parse_tolk_int_literal(&text)?;
+                parsed
+                    .parse_u64()
+                    .map(|value| format!("int:{value}"))
+                    .or_else(|| Some(format!("int:{text}")))
+            }
+            "string_literal" => self
+                .node_text(file_id, node)
+                .map(|text| format!("string:{}", text.trim_matches('"'))),
+            "boolean_literal" => self
+                .node_text(file_id, node)
+                .map(|text| format!("bool:{text}")),
+            "identifier" | "dot_access" => {
+                let resolved_node = if node.kind() == "dot_access" {
+                    node.child_by_field_name("field").unwrap_or(node)
+                } else {
+                    node
+                };
+                match self.resolved_node(file_id, resolved_node, resolved_by_span) {
+                    Some(Resolved::Global(symbol)) => self.constant_keys.get(symbol).cloned(),
+                    Some(Resolved::Local(_)) | Some(Resolved::Unresolved) | None => None,
+                }
+            }
+            "parenthesized_expression" | "not_null_operator" => self.collection_key(
+                file_id,
+                node.child_by_field_name("inner")?,
+                resolved_by_span,
+            ),
+            "cast_as_operator" => {
+                self.collection_key(file_id, node.child_by_field_name("expr")?, resolved_by_span)
+            }
+            _ => None,
+        }
+    }
+
+    fn collection_lookup(
+        &self,
+        file_id: FileId,
+        collection: &CallableValue,
+        key: Option<Node<'_>>,
+        resolved_by_span: &ResolutionsBySpan,
+    ) -> CallableValue {
+        key.and_then(|key| self.collection_key(file_id, key, resolved_by_span))
+            .map_or_else(|| collection.any_member(), |key| collection.member(&key))
+    }
+
+    fn map_lookup_result(value: CallableValue) -> CallableValue {
+        let mut result = CallableValue::non_callable();
+        result.members_complete = true;
+        result.members.insert(MAP_VALUE_MEMBER.into(), value);
+        result
+    }
+
+    fn call_arguments<'tree>(call: Node<'tree>) -> Vec<Node<'tree>> {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return vec![];
+        };
+        let mut cursor = arguments.walk();
+        arguments
+            .named_children(&mut cursor)
+            .filter_map(|argument| argument.child_by_field_name("expr"))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collection_call_value(
+        &self,
+        file_id: FileId,
+        call: Node<'_>,
+        state: &CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+        depth: usize,
+    ) -> Option<CallableValue> {
+        let callee = call.child_by_field_name("callee")?;
+        let callee = if callee.kind() == "generic_instantiation" {
+            callee.child_by_field_name("expr")?
+        } else {
+            callee
+        };
+        if callee.kind() != "dot_access" {
+            return None;
+        }
+        let receiver = callee.child_by_field_name("obj")?;
+        let method = self.node_text(file_id, callee.child_by_field_name("field")?)?;
+        let collection = self.callable_value_depth(
+            file_id,
+            receiver,
+            state,
+            resolved_by_span,
+            return_values,
+            depth + 1,
+        );
+
+        if method == "loadValue" && collection.members.contains_key(MAP_VALUE_MEMBER) {
+            return Some(collection.member(MAP_VALUE_MEMBER));
+        }
+
+        let kind = self.collection_kind(file_id, receiver)?;
+        let arguments = Self::call_arguments(call);
+        match (kind, method.as_str()) {
+            (CollectionKind::Array, "get") => Some(self.collection_lookup(
+                file_id,
+                &collection,
+                arguments.first().copied(),
+                resolved_by_span,
+            )),
+            (CollectionKind::Array, "first") => Some(collection.member("int:0")),
+            (CollectionKind::Array, "last" | "pop") => {
+                let value = collection.array_lengths.as_ref().map_or_else(
+                    || collection.any_member(),
+                    |lengths| {
+                        let mut value = CallableValue::bottom();
+                        for length in lengths.iter().filter(|length| **length > 0) {
+                            value = merged_callable_value(
+                                &value,
+                                &collection.member(&format!("int:{}", length - 1)),
+                            );
+                        }
+                        value
+                    },
+                );
+                Some(value)
+            }
+            (CollectionKind::Map, "get") => Some(Self::map_lookup_result(self.collection_lookup(
+                file_id,
+                &collection,
+                arguments.first().copied(),
+                resolved_by_span,
+            ))),
+            (CollectionKind::Map, "mustGet") => Some(self.collection_lookup(
+                file_id,
+                &collection,
+                arguments.first().copied(),
+                resolved_by_span,
+            )),
+            (CollectionKind::Map, "set") => {
+                let mut updated = collection;
+                if let Some(value) = arguments.get(1) {
+                    let value = self.callable_value_depth(
+                        file_id,
+                        *value,
+                        state,
+                        resolved_by_span,
+                        return_values,
+                        depth + 1,
+                    );
+                    if let Some(key) = arguments
+                        .first()
+                        .and_then(|key| self.collection_key(file_id, *key, resolved_by_span))
+                    {
+                        updated.members.insert(key, value);
+                    } else {
+                        updated.set_dynamic_member(value);
+                    }
+                }
+                Some(updated)
+            }
+            _ => None,
+        }
+    }
+
     fn callable_value_depth(
         &self,
         file_id: FileId,
@@ -1743,6 +2330,16 @@ impl<'a> SnapshotBuilder<'a> {
                 .map(CallableValue::target)
                 .unwrap_or_default(),
             "function_call" => {
+                if let Some(value) = self.collection_call_value(
+                    file_id,
+                    node,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    depth,
+                ) {
+                    return value;
+                }
                 let Some(callee) = node.child_by_field_name("callee") else {
                     return CallableValue::default();
                 };
@@ -1858,9 +2455,19 @@ impl<'a> SnapshotBuilder<'a> {
                 let mut value = CallableValue::non_callable();
                 value.members_complete = true;
                 let mut cursor = node.walk();
-                for (index, element) in node.named_children(&mut cursor).enumerate() {
+                let elements = node.named_children(&mut cursor).collect::<Vec<_>>();
+                let is_array = node.kind() == "typed_tuple"
+                    && self.collection_kind(file_id, node) == Some(CollectionKind::Array);
+                if is_array {
+                    value.array_lengths = Some(BTreeSet::from([elements.len()]));
+                }
+                for (index, element) in elements.into_iter().enumerate() {
                     value.members.insert(
-                        index.to_string(),
+                        if is_array {
+                            format!("int:{index}")
+                        } else {
+                            index.to_string()
+                        },
                         self.callable_value_depth(
                             file_id,
                             element,
@@ -2086,6 +2693,24 @@ impl<'a> SnapshotBuilder<'a> {
             }
         }
         values.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
+        values
+    }
+
+    fn collect_constant_keys(&self, files: &[Arc<tolk_resolver::FileIndex>]) -> ConstantKeys {
+        let mut evaluator = ConstantEvaluator::new(self);
+        let mut values = ConstantKeys::new();
+        for file in files {
+            for symbol in all_global_symbols(&file.decls) {
+                let evaluated = match symbol.kind {
+                    SymbolKind::Constant => evaluator.evaluate_constant(symbol.id),
+                    SymbolKind::EnumMember => evaluator.evaluate_enum_member(symbol.id),
+                    _ => continue,
+                };
+                if let Some(key) = constant_collection_key(&evaluated) {
+                    values.insert(symbol.id, key);
+                }
+            }
+        }
         values
     }
 
@@ -2389,6 +3014,38 @@ fn constant_value(value: ActonConstantValue) -> ConstantValue {
     }
 }
 
+fn constant_collection_key(value: &ActonConstantValue) -> Option<String> {
+    match value {
+        ActonConstantValue::Int(value) => Some(format!("int:{value}")),
+        ActonConstantValue::Bool(value) => Some(format!("bool:{value}")),
+        ActonConstantValue::String(value) => Some(format!("string:{value}")),
+        ActonConstantValue::Overflow | ActonConstantValue::Unknown => None,
+    }
+}
+
+fn collection_kinds(bodies: &WorkspaceBodyTypes, type_db: &TypeDb<'_>) -> CollectionKinds {
+    let mut kinds = CollectionKinds::new();
+    for (&file_id, file_bodies) in bodies {
+        for inference in file_bodies.values() {
+            for (&span, &ty) in &inference.expression_types {
+                let ty = type_db.intrn.unwrap_alias(ty);
+                let kind = match type_db.intrn.data(ty) {
+                    TyData::Array(_) => Some(CollectionKind::Array),
+                    TyData::MapKV { .. } => Some(CollectionKind::Map),
+                    TyData::Struct { name, .. } if name.as_ref() == "map" => {
+                        Some(CollectionKind::Map)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    kinds.insert((file_id, span.start, span.end), kind);
+                }
+            }
+        }
+    }
+    kinds
+}
+
 const fn control_flow_node_kind(kind: ActonFlowNodeKind) -> &'static str {
     match kind {
         ActonFlowNodeKind::Entry => "entry",
@@ -2641,6 +3298,10 @@ fn merged_callable_value(left: &CallableValue, right: &CallableValue) -> Callabl
         complete: left.complete && right.complete,
         members,
         members_complete: left.members_complete && right.members_complete,
+        array_lengths: match (&left.array_lengths, &right.array_lengths) {
+            (Some(left), Some(right)) => Some(left.union(right).copied().collect()),
+            (None, _) | (_, None) => None,
+        },
         bottom: false,
     }
 }
@@ -2735,6 +3396,44 @@ mod tests {
                 .collect(),
             entrypoints: roots.iter().map(|path| (*path).into()).collect(),
             stdlib_root: None,
+            acton_stdlib_root: None,
+            import_mappings: BTreeMap::new(),
+            control_flow: ControlFlowScope::Workspace,
+        })
+        .unwrap()
+    }
+
+    fn project_with_stdlib(source: &str) -> ProjectSnapshot {
+        let common = r#"
+tolk 1.4
+type int = builtin
+type bool = builtin
+type cell = builtin
+type unknown = builtin
+struct map<K, V> { private tvmDict: cell? }
+struct array<T> { private tvmTuple: unknown }
+struct MapLookupResult<TValue> { private value: TValue, isFound: bool }
+fun array<T>.push(mutate self, value: T): void builtin
+fun array<T>.first(self): T builtin
+fun array<T>.get(self, index: int): T builtin
+fun array<T>.set(mutate self, value: T, index: int): void builtin
+fun array<T>.last(self): T builtin
+fun array<T>.pop(mutate self): T builtin
+fun map<K, V>.get(self, key: K): MapLookupResult<V> builtin
+fun map<K, V>.mustGet(self, key: K, throwIfNotFound: int = 9): V builtin
+fun map<K, V>.set(mutate self, key: K, value: V): self builtin
+fun MapLookupResult<TValue>.loadValue(self): TValue { return self.value; }
+"#;
+        inspect(ProjectInput {
+            root: "/project".into(),
+            files: [
+                ("/project/main.tolk".into(), source.into()),
+                ("/project/stdlib/common.tolk".into(), common.into()),
+            ]
+            .into_iter()
+            .collect(),
+            entrypoints: vec!["/project/main.tolk".into()],
+            stdlib_root: Some("/project/stdlib".into()),
             acton_stdlib_root: None,
             import_mappings: BTreeMap::new(),
             control_flow: ControlFlowScope::Workspace,
@@ -3440,6 +4139,314 @@ fun audit(flag: bool, value: int): int {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn resolves_callable_array_elements_after_get_set_and_push() {
+        let source = r#"
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+fun review(value: int): int { return value + 3; }
+fun identity<T>(value: T): T { return value; }
+
+fun audit(index: int, value: int): int {
+    var handlers: array<(int) -> int> = [allow, reject];
+    handlers.set(review, 1);
+    handlers.push(reject);
+    val forwarded = identity(handlers);
+    val exact = forwarded.get(0);
+    val pushed = forwarded.get(2);
+    val selected = forwarded.get(index);
+    return exact(pushed(selected(value)));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let audit = global("audit");
+        let mut indirect = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| call.caller == audit.id && call.dispatch == "indirect")
+            .collect::<Vec<_>>();
+        indirect.sort_by_key(|call| call.location.byte_range.start);
+        indirect.retain(|call| !call.targets.is_empty());
+        assert_eq!(indirect.len(), 3);
+        assert!(indirect.iter().all(|call| call.complete));
+        assert_eq!(indirect[0].targets, vec![global("allow").id.clone()]);
+        assert_eq!(indirect[1].targets, vec![global("reject").id.clone()]);
+        assert_eq!(
+            indirect[2].targets.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                global("allow").id.clone(),
+                global("reject").id.clone(),
+                global("review").id.clone(),
+            ])
+        );
+    }
+
+    #[test]
+    fn resolves_callable_map_values_for_constant_and_dynamic_keys() {
+        let source = r#"
+const PRIMARY = 7;
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+fun identity<T>(value: T): T { return value; }
+fun audit(key: int, flag: bool, value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(PRIMARY, allow);
+    val exact = handlers.mustGet(PRIMARY);
+    if (flag) {
+        handlers.set(9, reject);
+    }
+    val forwarded = identity(handlers);
+    val selected = forwarded.get(key).loadValue();
+    return exact(selected(value));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let audit = global("audit");
+        let mut indirect = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| call.caller == audit.id && call.dispatch == "indirect")
+            .collect::<Vec<_>>();
+        indirect.sort_by_key(|call| call.location.byte_range.start);
+        indirect.retain(|call| !call.targets.is_empty());
+        assert_eq!(indirect.len(), 2);
+        assert!(indirect.iter().all(|call| call.complete));
+        assert_eq!(indirect[0].targets, vec![global("allow").id.clone()]);
+        assert_eq!(
+            indirect[1].targets.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([global("allow").id.clone(), global("reject").id.clone()])
+        );
+    }
+
+    #[test]
+    fn keeps_dynamic_collection_writes_sound_and_external_collections_incomplete() {
+        let source = r#"
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+
+fun knownMap(key: int, value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, allow);
+    handlers.set(key, reject);
+    return handlers.mustGet(1)(value);
+}
+
+fun externalArray(handlers: array<(int) -> int>, index: int, value: int): int {
+    return handlers.get(index)(value);
+}
+
+fun externalMap(handlers: map<int, (int) -> int>, key: int, value: int): int {
+    return handlers.mustGet(key)(value);
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+
+        let known = snapshot
+            .call_sites
+            .iter()
+            .find(|call| {
+                call.caller == global("knownMap").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .expect("known map callback call");
+        assert!(known.complete);
+        assert_eq!(
+            known.targets.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([global("allow").id.clone(), global("reject").id.clone()])
+        );
+
+        for caller in ["externalArray", "externalMap"] {
+            let call = snapshot
+                .call_sites
+                .iter()
+                .find(|call| {
+                    call.caller == global(caller).id
+                        && call.dispatch == "indirect"
+                        && call.targets.is_empty()
+                })
+                .expect("external collection callback call");
+            assert!(!call.complete);
+        }
+    }
+
+    #[test]
+    fn widens_callable_collection_updates_across_branches_and_loops() {
+        let source = r#"
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+
+fun audit(index: int, count: int, flag: bool, value: int): int {
+    var handlers: array<(int) -> int> = [allow];
+    if (flag) {
+        handlers.push(reject);
+    }
+    var remaining = count;
+    while (remaining > 0) {
+        handlers.push(reject);
+        remaining -= 1;
+    }
+    return handlers.get(index)(value);
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| call.caller == global("audit").id && call.dispatch == "indirect")
+            .expect("collection callback call");
+        assert!(call.complete);
+        assert_eq!(
+            call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([global("allow").id.clone(), global("reject").id.clone()])
+        );
+    }
+
+    #[test]
+    fn resolves_array_end_operations_and_chained_map_updates() {
+        let source = r#"
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+
+fun arrayAudit(value: int): int {
+    var handlers: array<(int) -> int> = [allow, reject];
+    val first = handlers.first();
+    val popped = handlers.pop();
+    val last = handlers.last();
+    return first(popped(last(value)));
+}
+
+fun mapAudit(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    return handlers.set(3, reject).mustGet(3)(value);
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let array_calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("arrayAudit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(array_calls.len(), 3);
+        assert_eq!(
+            array_calls
+                .iter()
+                .filter(|call| call.targets == vec![global("allow").id.clone()])
+                .count(),
+            2
+        );
+        assert_eq!(
+            array_calls
+                .iter()
+                .filter(|call| call.targets == vec![global("reject").id.clone()])
+                .count(),
+            1
+        );
+
+        let map_call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| {
+                call.caller == global("mapAudit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .expect("chained map callback call");
+        assert!(map_call.complete);
+        assert_eq!(map_call.targets, vec![global("reject").id.clone()]);
+    }
+
+    #[test]
+    fn propagates_collection_mutations_through_helper_parameters() {
+        let source = r#"
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+
+fun append(mutate handlers: array<(int) -> int>, callback: ((int) -> int)) {
+    handlers.push(callback);
+}
+
+fun register(
+    mutate handlers: map<int, (int) -> int>,
+    key: int,
+    callback: ((int) -> int)
+) {
+    handlers.set(key, callback);
+}
+
+fun audit(value: int): int {
+    var arrayHandlers: array<(int) -> int> = [allow];
+    append(arrayHandlers, reject);
+    var mapHandlers: map<int, (int) -> int> = [];
+    register(mapHandlers, 4, reject);
+    return arrayHandlers.get(1)(mapHandlers.mustGet(4)(value));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("audit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.complete));
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.targets == vec![global("reject").id.clone()])
+        );
     }
 
     #[test]

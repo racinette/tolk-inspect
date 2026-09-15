@@ -92,15 +92,39 @@ complete. Recursive forwarding helpers are solved to the same fixed point.
 The analysis follows direct function, get-method, resolved method, and lambda references
 through assignments, wrappers, local copies, ternaries, branches, loops, and exceptional
 paths. A whole-program fixed point propagates callable values through arguments, callback
-parameters, function returns, recursion, and nested tuple/object fields. Each lambda has a
-stable synthetic `SymbolInfo`, so callers can navigate its target like any other symbol.
+parameters, function returns, recursion, nested tuple/object fields, and array/map values.
+Each lambda has a stable synthetic `SymbolInfo`, so callers can navigate its target like any
+other symbol.
 Calls inside a lambda use that synthetic symbol as their `caller`. Captured callable
 values are snapshotted at the lambda's creation point, matching Tolk's by-value closure
 semantics, and nested-lambda captures propagate transitively.
 
-The analysis is context-insensitive: all calls to one function contribute to the same
-parameter and return summaries. This deliberately produces a safe union of targets rather
-than a per-caller result.
+The call graph is intentionally a whole-program may-call graph. For example, if
+`invoke(fn) { fn() }` is called once with `allow` and once with `reject`, the call inside
+`invoke` reports both targets. Without a particular invocation context, the safe answer
+is the union of every reachable callee rather than a per-invocation result.
+
+## Arrays and maps
+
+Standard collection operations participate in the same CFG and whole-program fixed point.
+Array literals preserve exact positions; `get`, `first`, `last`, `set`, `push`, and `pop` carry
+callable values. Map `set`, `mustGet`, and `get(...).loadValue()` preserve values by key.
+
+Literal and evaluated constant indexes/keys select one tracked entry. A dynamic index/key
+returns the union of all entries it may select, while a dynamic write is conservatively
+included in every compatible later lookup. Collection values and mutations also propagate
+through function parameters, returns, branches, loops, and `mutate` helper parameters.
+
+```tolk
+fun invoke(index: int, value: int): int {
+    var handlers: array<(int) -> int> = [allow, reject];
+    handlers.push(review);
+
+    val exact = handlers.get(0);     // target: allow
+    val selected = handlers.get(index); // targets: allow, reject, review
+    return exact(selected(value));
+}
+```
 
 The analysis always computes the internal CFGs it needs. Setting `controlFlow: "none"`
 only omits public CFG objects and does not reduce call-site or call-graph precision.
