@@ -12,7 +12,7 @@ use tolk_analysis::{
 };
 use tolk_dataflow::{
     ControlFlowGraph as ActonControlFlowGraph, EdgeKind as ActonEdgeKind,
-    FlowNodeKind as ActonFlowNodeKind,
+    FlowNodeKind as ActonFlowNodeKind, build_cfg_for_function_with_source,
 };
 use tolk_linter::diagnostic::{
     Applicability as LintApplicability, DiagnosticTag as LintDiagnosticTag,
@@ -31,19 +31,169 @@ pub const TOLK_VERSION: &str = "1.4.2";
 
 type ResolutionsBySpan = HashMap<(FileId, u32, u32), Resolved>;
 type CallableState = HashMap<tolk_resolver::resolve_index::LocalDefId, CallableValue>;
+type ParameterValues = HashMap<SymbolId, Vec<Option<CallableValue>>>;
+type ReturnValues = HashMap<SymbolId, CallableValue>;
+type CaptureValues =
+    HashMap<SymbolId, HashMap<tolk_resolver::resolve_index::LocalDefId, CallableValue>>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CallableValue {
-    targets: BTreeSet<tolk_resolver::SymbolId>,
+    targets: BTreeSet<SymbolId>,
     complete: bool,
+    members: BTreeMap<String, CallableValue>,
+    members_complete: bool,
+    bottom: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PendingIndirectCall {
+impl CallableValue {
+    fn target(target: SymbolId) -> Self {
+        Self {
+            targets: BTreeSet::from([target]),
+            complete: true,
+            ..Self::default()
+        }
+    }
+
+    fn non_callable() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+
+    fn bottom() -> Self {
+        Self {
+            complete: true,
+            members_complete: true,
+            bottom: true,
+            ..Self::default()
+        }
+    }
+
+    fn member(&self, key: &str) -> Self {
+        if self.bottom {
+            return Self::bottom();
+        }
+        self.members.get(key).cloned().unwrap_or_else(|| {
+            if self.members_complete {
+                Self::non_callable()
+            } else {
+                Self::default()
+            }
+        })
+    }
+
+    fn set_member_path(&mut self, path: &[String], value: Self) {
+        if self.bottom {
+            *self = Self::default();
+        }
+        let Some((head, tail)) = path.split_first() else {
+            *self = value;
+            return;
+        };
+        if tail.is_empty() {
+            self.members.insert(head.clone(), value);
+        } else {
+            self.members
+                .entry(head.clone())
+                .or_default()
+                .set_member_path(tail, value);
+        }
+    }
+
+    fn limit_member_depth(&mut self, remaining: usize) {
+        if self.bottom || self.members.is_empty() {
+            return;
+        }
+        if remaining == 0 {
+            self.members.clear();
+            self.members_complete = false;
+            return;
+        }
+        for member in self.members.values_mut() {
+            member.limit_member_depth(remaining - 1);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalPath {
+    root: tolk_resolver::resolve_index::LocalDefId,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProgramCall {
     file_id: FileId,
-    caller: tolk_resolver::SymbolId,
-    local: tolk_resolver::resolve_index::LocalDefId,
+    caller: SymbolId,
     span: Span,
+}
+
+#[derive(Debug, Clone)]
+struct CallableDefinition {
+    file_id: FileId,
+    acton_symbol: Option<tolk_resolver::SymbolId>,
+    graph: Arc<ActonControlFlowGraph>,
+    parameters: Vec<tolk_resolver::resolve_index::LocalDefId>,
+    captures: Vec<tolk_resolver::resolve_index::LocalDefId>,
+}
+
+#[derive(Debug, Clone)]
+struct LambdaCreation {
+    file_id: FileId,
+    owner: SymbolId,
+    lambda: SymbolId,
+    span: Span,
+}
+
+#[derive(Debug, Default)]
+struct ProgramAnalysis {
+    call_sites: Vec<CallSite>,
+    parameters: ParameterValues,
+    returns: ReturnValues,
+    captures: CaptureValues,
+}
+
+#[derive(Clone)]
+struct LambdaAsFunction<'tree>(tolk_syntax::Lambda<'tree>);
+
+impl<'tree> tolk_syntax::TryFromNode<'tree> for LambdaAsFunction<'tree> {
+    type Error = tolk_syntax::InvalidNodeKindError;
+
+    fn try_from_node(node: Node<'tree>) -> std::result::Result<Self, Self::Error> {
+        <tolk_syntax::Lambda<'tree> as tolk_syntax::TryFromNode<'tree>>::try_from_node(node)
+            .map(Self)
+    }
+}
+
+impl<'tree> tolk_syntax::AstNode<'tree> for LambdaAsFunction<'tree> {
+    fn syntax(&self) -> Node<'tree> {
+        self.0.0
+    }
+}
+
+impl<'tree> tolk_syntax::HasName<'tree> for LambdaAsFunction<'tree> {
+    type Name = tolk_syntax::Ident<'tree>;
+
+    fn name(&self) -> Option<Self::Name> {
+        None
+    }
+}
+
+impl<'tree> tolk_syntax::FunctionLike<'tree> for LambdaAsFunction<'tree> {
+    fn return_type(&self) -> Option<tolk_syntax::Type<'tree>> {
+        self.0.return_type()
+    }
+
+    fn body(&self) -> Option<tolk_syntax::FuncBody<'tree>> {
+        self.0.body().map(tolk_syntax::FuncBody::Block)
+    }
+
+    fn parameters(&self) -> tolk_syntax::AstChildren<'tree, tolk_syntax::Parameter<'tree>> {
+        // Acton's CFG builder currently consumes only `body()`. Lambda parameters use a
+        // distinct AST wrapper and are mapped to resolver locals by `tolk-inspect`.
+        tolk_syntax::AstChildren::default()
+    }
 }
 
 #[derive(Debug)]
@@ -156,6 +306,7 @@ struct SnapshotBuilder<'a> {
     node_ids: HashMap<(FileId, u32, u32), NodeId>,
     symbol_ids: HashMap<tolk_resolver::SymbolId, SymbolId>,
     local_ids: HashMap<tolk_resolver::resolve_index::LocalDefId, SymbolId>,
+    lambda_ids: HashMap<(FileId, u32, u32), SymbolId>,
     nodes: Vec<AstNode>,
     symbols: Vec<SymbolInfo>,
     diagnostics: Vec<Diagnostic>,
@@ -177,6 +328,7 @@ impl<'a> SnapshotBuilder<'a> {
             node_ids: HashMap::new(),
             symbol_ids: HashMap::new(),
             local_ids: HashMap::new(),
+            lambda_ids: HashMap::new(),
             nodes: vec![],
             symbols: vec![],
             diagnostics: vec![],
@@ -278,6 +430,7 @@ impl<'a> SnapshotBuilder<'a> {
         }
 
         self.collect_symbols(&indexed_files);
+        self.collect_lambda_symbols(&indexed_files);
         let constant_values = self.collect_constant_values(&indexed_files);
 
         let mut interner = TypeInterner::new();
@@ -596,6 +749,132 @@ impl<'a> SnapshotBuilder<'a> {
         self.symbols.sort_by(|a, b| a.id.cmp(&b.id));
     }
 
+    fn collect_lambda_symbols(&mut self, files: &[Arc<tolk_resolver::FileIndex>]) {
+        #[derive(Clone)]
+        struct LambdaDescriptor {
+            file_id: FileId,
+            path: String,
+            start: u32,
+            end: u32,
+            node_id: NodeId,
+            body: Option<SourceLocation>,
+        }
+
+        let file_ids = files
+            .iter()
+            .map(|file| (self.paths[&file.id].clone(), file.id))
+            .collect::<HashMap<_, _>>();
+        let lambdas = self
+            .nodes
+            .iter()
+            .filter(|node| node.raw_kind == "lambda_expression")
+            .filter_map(|node| {
+                let file_id = *file_ids.get(&node.location.path)?;
+                let body = node
+                    .fields
+                    .get("body")
+                    .and_then(|ids| ids.first())
+                    .and_then(|id| self.nodes.iter().find(|candidate| candidate.id == *id))
+                    .map(|body| body.location.clone());
+                Some(LambdaDescriptor {
+                    file_id,
+                    path: node.location.path.clone(),
+                    start: node.location.byte_range.start,
+                    end: node.location.byte_range.end,
+                    node_id: node.id.clone(),
+                    body,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for lambda in &lambdas {
+            self.lambda_ids.insert(
+                (lambda.file_id, lambda.start, lambda.end),
+                format!("lambda:{}:{}:{}", lambda.path, lambda.start, lambda.end),
+            );
+        }
+        for lambda in &lambdas {
+            let id = self.lambda_ids[&(lambda.file_id, lambda.start, lambda.end)].clone();
+            let global_owner = self
+                .file_db
+                .get_by_id(lambda.file_id)
+                .and_then(|file| {
+                    file.find_symbol_at(lambda.start as usize)
+                        .map(|symbol| symbol.id)
+                })
+                .and_then(|symbol| self.symbol_ids.get(&symbol).cloned());
+            let containing_symbol = lambdas
+                .iter()
+                .filter(|candidate| {
+                    candidate.file_id == lambda.file_id
+                        && candidate.start < lambda.start
+                        && candidate.end > lambda.end
+                })
+                .min_by_key(|candidate| candidate.end - candidate.start)
+                .map(|candidate| {
+                    self.lambda_ids[&(candidate.file_id, candidate.start, candidate.end)].clone()
+                })
+                .or(global_owner.clone());
+            let owner_fqn = global_owner
+                .as_ref()
+                .and_then(|owner| self.symbols.iter().find(|symbol| symbol.id == *owner))
+                .map_or("<unknown>", |symbol| symbol.fqn.as_str());
+            let declaration =
+                self.location(lambda.file_id, lambda.start as usize, lambda.end as usize);
+            self.symbols.push(SymbolInfo {
+                id,
+                name: "<lambda>".into(),
+                fqn: format!(
+                    "{owner_fqn}::<lambda@{}:{}>",
+                    declaration.range.start.line + 1,
+                    declaration.range.start.character + 1
+                ),
+                kind: "lambda".into(),
+                declaration,
+                body: lambda.body.clone(),
+                containing_symbol,
+                documentation: None,
+                flags: SymbolFlags {
+                    private: true,
+                    local: true,
+                    ..Default::default()
+                },
+                node_id: Some(lambda.node_id.clone()),
+            });
+        }
+
+        let lambda_owners = self
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "lambda")
+            .map(|symbol| {
+                (
+                    symbol.id.clone(),
+                    symbol.fqn.clone(),
+                    symbol.declaration.path.clone(),
+                    symbol.declaration.byte_range,
+                )
+            })
+            .collect::<Vec<_>>();
+        for symbol in self.symbols.iter_mut().filter(|symbol| {
+            symbol.flags.local && symbol.kind != "lambda" && symbol.kind != "typeParameter"
+        }) {
+            let owner = lambda_owners
+                .iter()
+                .filter(|(_, _, path, range)| {
+                    *path == symbol.declaration.path
+                        && range.start <= symbol.declaration.byte_range.start
+                        && range.end >= symbol.declaration.byte_range.end
+                })
+                .min_by_key(|(_, _, _, range)| range.end - range.start);
+            if let Some((id, fqn, _, _)) = owner {
+                symbol.containing_symbol = Some(id.clone());
+                symbol.fqn = format!("{fqn}::{}", symbol.name);
+            }
+        }
+        self.symbols.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+
     fn push_global_symbol(
         &mut self,
         file_id: FileId,
@@ -690,8 +969,6 @@ impl<'a> SnapshotBuilder<'a> {
             .collect::<ResolutionsBySpan>();
         let mut references = vec![];
         let mut resolutions = vec![];
-        let mut call_sites = vec![];
-        let mut pending_indirect = vec![];
         for ((file_id, _, _, _), usage) in uses {
             let symbol_id = match usage.resolved {
                 Resolved::Global(id) => self.symbol_ids.get(&id).cloned(),
@@ -702,7 +979,6 @@ impl<'a> SnapshotBuilder<'a> {
                 .exact_node(file_id, usage.span)
                 .or_else(|| self.smallest_node(file_id, usage.span));
             let is_call = self.call_node(file_id, usage.span);
-            let is_call_target = self.call_target_node(file_id, usage.span);
             let access_flags = analysis_db
                 .use_facts(self.file_db, self.project, bodies, file_id)
                 .and_then(|facts| facts.per_usage.get(&usage.span).copied())
@@ -745,37 +1021,6 @@ impl<'a> SnapshotBuilder<'a> {
                     resolved: symbol_id.is_some(),
                 });
             }
-            if let Some(call_span) = is_call_target {
-                let caller = self.file_db.get_by_id(file_id).and_then(|info| {
-                    info.find_symbol_at(usage.decl as usize)
-                        .map(|symbol| symbol.id)
-                });
-                if let Some(caller) = caller {
-                    match usage.resolved {
-                        Resolved::Global(callee) if self.is_callable_symbol(callee) => {
-                            call_sites.push(CallSite {
-                                caller: self.symbol_ids[&caller].clone(),
-                                location: self.location(
-                                    file_id,
-                                    call_span.start(),
-                                    call_span.end(),
-                                ),
-                                node_id: self.exact_node(file_id, call_span),
-                                dispatch: "direct".into(),
-                                targets: vec![self.symbol_ids[&callee].clone()],
-                                complete: true,
-                            });
-                        }
-                        Resolved::Local(local) => pending_indirect.push(PendingIndirectCall {
-                            file_id,
-                            caller,
-                            local,
-                            span: call_span,
-                        }),
-                        Resolved::Global(_) | Resolved::Unresolved => {}
-                    }
-                }
-            }
             if symbol_id.is_none() {
                 self.diagnostics.push(Diagnostic {
                     phase: "resolution".into(),
@@ -793,12 +1038,14 @@ impl<'a> SnapshotBuilder<'a> {
         references.sort_by(|a, b| reference_key(a).cmp(&reference_key(b)));
         resolutions.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         resolutions.dedup_by(|a, b| a.node_id == b.node_id && a.symbol_id == b.symbol_id);
-        call_sites.extend(self.collect_indirect_call_sites(
+        let (program_calls, lambda_creations) = self.collect_program_calls();
+        let mut call_sites = self.collect_program_call_sites(
             type_db,
             analysis_db,
             &resolved_by_span,
-            &pending_indirect,
-        ));
+            &program_calls,
+            &lambda_creations,
+        );
         normalize_call_sites(&mut call_sites);
         let mut calls = call_sites
             .iter()
@@ -817,61 +1064,511 @@ impl<'a> SnapshotBuilder<'a> {
         (references, resolutions, call_sites, calls)
     }
 
-    fn collect_indirect_call_sites(
+    fn collect_program_calls(&self) -> (Vec<ProgramCall>, Vec<LambdaCreation>) {
+        let mut calls = vec![];
+        let mut creations = vec![];
+        for file in self.project.files().values() {
+            let Some(info) = self.file_db.get_by_id(file.id) else {
+                continue;
+            };
+            for symbol in all_global_symbols(&file.decls) {
+                if !self.is_callable_symbol(symbol.id) {
+                    continue;
+                }
+                let Some(declaration) = info.find_syntax_declaration(symbol.id) else {
+                    continue;
+                };
+                collect_owned_call_nodes(
+                    declaration.syntax(),
+                    file.id,
+                    &self.symbol_ids[&symbol.id],
+                    &self.lambda_ids,
+                    &mut calls,
+                    &mut creations,
+                );
+            }
+        }
+        calls.sort_by(|left, right| {
+            (left.file_id, left.span.start, left.span.end, &left.caller).cmp(&(
+                right.file_id,
+                right.span.start,
+                right.span.end,
+                &right.caller,
+            ))
+        });
+        calls.dedup_by(|left, right| {
+            (left.file_id, left.span, &left.caller) == (right.file_id, right.span, &right.caller)
+        });
+        creations.sort_by(|left, right| {
+            (&left.owner, left.file_id, left.span.start, &left.lambda).cmp(&(
+                &right.owner,
+                right.file_id,
+                right.span.start,
+                &right.lambda,
+            ))
+        });
+        creations.dedup_by(|left, right| {
+            left.owner == right.owner && left.lambda == right.lambda && left.span == right.span
+        });
+        (calls, creations)
+    }
+
+    fn callable_definitions(
+        &self,
+        type_db: &TypeDb<'_>,
+        analysis_db: &mut AnalysisDb,
+    ) -> BTreeMap<SymbolId, CallableDefinition> {
+        let mut definitions = BTreeMap::new();
+        for file in self.project.files().values() {
+            for symbol in all_global_symbols(&file.decls) {
+                if !self.is_callable_symbol(symbol.id) {
+                    continue;
+                }
+                let Some(graph) = analysis_db.cfg_for_symbol(type_db, symbol.id) else {
+                    continue;
+                };
+                let Some(info) = self.file_db.get_by_id(file.id) else {
+                    continue;
+                };
+                let Some(declaration) = info.find_syntax_declaration(symbol.id) else {
+                    continue;
+                };
+                definitions.insert(
+                    self.symbol_ids[&symbol.id].clone(),
+                    CallableDefinition {
+                        file_id: file.id,
+                        acton_symbol: Some(symbol.id),
+                        graph,
+                        parameters: self.callable_parameters(file.id, declaration.syntax()),
+                        captures: vec![],
+                    },
+                );
+            }
+        }
+        for (&(file_id, start, end), public_id) in &self.lambda_ids {
+            let span = Span { start, end };
+            let Some(file) = self.file_db.get_by_id(file_id) else {
+                continue;
+            };
+            let Some(node) = file.find_node_at_span(span) else {
+                continue;
+            };
+            let Some(graph) = self.lambda_cfg(file_id, span) else {
+                continue;
+            };
+            definitions.insert(
+                public_id.clone(),
+                CallableDefinition {
+                    file_id,
+                    acton_symbol: None,
+                    graph,
+                    parameters: self.callable_parameters(file_id, node),
+                    captures: self.lambda_captures(file_id, span),
+                },
+            );
+        }
+        definitions
+    }
+
+    fn callable_parameters(
+        &self,
+        file_id: FileId,
+        declaration: Node<'_>,
+    ) -> Vec<tolk_resolver::resolve_index::LocalDefId> {
+        let Some(resolve) = self.project.get_resolved_uses(file_id) else {
+            return vec![];
+        };
+        let Some(parameters) = declaration.child_by_field_name("parameters") else {
+            return vec![];
+        };
+        let mut result = vec![];
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let Some(name) = parameter.child_by_field_name("name") else {
+                continue;
+            };
+            if let Some(local) = resolve.find_local_at(name.start_byte()) {
+                result.push(local.id);
+            }
+        }
+        result
+    }
+
+    fn lambda_captures(
+        &self,
+        file_id: FileId,
+        lambda_span: Span,
+    ) -> Vec<tolk_resolver::resolve_index::LocalDefId> {
+        let Some(resolve) = self.project.get_resolved_uses(file_id) else {
+            return vec![];
+        };
+        let mut captures = resolve
+            .uses
+            .iter()
+            .filter(|usage| {
+                usage.span.start >= lambda_span.start && usage.span.end <= lambda_span.end
+            })
+            .filter_map(|usage| match usage.resolved {
+                Resolved::Local(local) => Some(local),
+                Resolved::Global(_) | Resolved::Unresolved => None,
+            })
+            .filter(|local| {
+                resolve.find_local(*local).is_some_and(|definition| {
+                    definition.def_span.start < lambda_span.start
+                        || definition.def_span.end > lambda_span.end
+                })
+            })
+            .collect::<Vec<_>>();
+        captures.sort_by_key(|local| (local.file_id, local.local));
+        captures.dedup();
+        captures
+    }
+
+    fn lambda_cfg(&self, file_id: FileId, span: Span) -> Option<Arc<ActonControlFlowGraph>> {
+        let file = self.file_db.get_by_id(file_id)?;
+        let node = file.find_node_at_span(span)?;
+        let lambda =
+            <LambdaAsFunction<'_> as tolk_syntax::TryFromNode<'_>>::try_from_node(node).ok()?;
+        let resolve = self.project.get_resolved_uses(file_id)?;
+        build_cfg_for_function_with_source(&lambda, resolve, Some(&file.source().source))
+            .map(Arc::new)
+    }
+
+    fn collect_program_call_sites(
         &self,
         type_db: &TypeDb<'_>,
         analysis_db: &mut AnalysisDb,
         resolved_by_span: &ResolutionsBySpan,
-        pending: &[PendingIndirectCall],
+        calls: &[ProgramCall],
+        lambda_creations: &[LambdaCreation],
     ) -> Vec<CallSite> {
-        let mut by_caller = BTreeMap::<tolk_resolver::SymbolId, Vec<&PendingIndirectCall>>::new();
-        for call in pending {
-            by_caller.entry(call.caller).or_default().push(call);
+        let definitions = self.callable_definitions(type_db, analysis_db);
+        let mut calls_by_caller = HashMap::<SymbolId, Vec<ProgramCall>>::new();
+        for call in calls {
+            calls_by_caller
+                .entry(call.caller.clone())
+                .or_default()
+                .push(call.clone());
         }
-
+        let mut parameters = ParameterValues::new();
+        let mut captures = CaptureValues::new();
+        let mut returns = definitions
+            .keys()
+            .map(|symbol| (symbol.clone(), CallableValue::bottom()))
+            .collect::<ReturnValues>();
         let mut call_sites = vec![];
-        for (caller, calls) in by_caller {
-            let Some(graph) = analysis_db.cfg_for_symbol(type_db, caller) else {
-                continue;
-            };
-            let states = self.callable_states(caller.file_id, graph.as_ref(), resolved_by_span);
+        let max_iterations = definitions.len().saturating_mul(4).max(8);
 
-            for call in calls {
-                let flow_node = graph
-                    .nodes()
-                    .iter()
-                    .filter(|node| {
-                        node.reads.contains(&call.local)
-                            && node.span.is_some_and(|span| {
-                                span.start <= call.span.start && span.end >= call.span.end
-                            })
-                    })
-                    .min_by_key(|node| node.span.map_or(u32::MAX, |span| span.end - span.start));
-                let Some(flow_node) = flow_node else {
-                    // Calls in lambda bodies do not belong to the enclosing function's CFG.
-                    continue;
-                };
-                let value = states[flow_node.id.index()]
-                    .as_ref()
-                    .and_then(|state| state.get(&call.local))
-                    .cloned()
-                    .unwrap_or_default();
-                let targets = value
-                    .targets
-                    .iter()
-                    .filter_map(|target| self.symbol_ids.get(target).cloned())
-                    .collect();
-                call_sites.push(CallSite {
-                    caller: self.symbol_ids[&caller].clone(),
-                    location: self.location(call.file_id, call.span.start(), call.span.end()),
-                    node_id: self.exact_node(call.file_id, call.span),
-                    dispatch: "indirect".into(),
-                    targets,
-                    complete: value.complete,
-                });
+        for _ in 0..max_iterations {
+            let analysis = self.analyze_program_calls(
+                resolved_by_span,
+                &calls_by_caller,
+                &definitions,
+                &parameters,
+                &returns,
+                &captures,
+                lambda_creations,
+                false,
+            );
+            let stable = analysis.parameters == parameters
+                && analysis.returns == returns
+                && analysis.captures == captures;
+            parameters = analysis.parameters;
+            returns = analysis.returns;
+            captures = analysis.captures;
+            call_sites = analysis.call_sites;
+            if stable {
+                break;
+            }
+        }
+        // Parameters with no whole-program inputs are true external origins, not lattice
+        // bottom. Re-run from the discovered internal summaries so that their uncertainty
+        // propagates through callers without contaminating recursive fixed points.
+        for _ in 0..max_iterations {
+            let analysis = self.analyze_program_calls(
+                resolved_by_span,
+                &calls_by_caller,
+                &definitions,
+                &parameters,
+                &returns,
+                &captures,
+                lambda_creations,
+                true,
+            );
+            let stable = analysis.parameters == parameters
+                && analysis.returns == returns
+                && analysis.captures == captures;
+            parameters = analysis.parameters;
+            returns = analysis.returns;
+            captures = analysis.captures;
+            call_sites = analysis.call_sites;
+            if stable {
+                break;
             }
         }
         call_sites
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_program_calls(
+        &self,
+        resolved_by_span: &ResolutionsBySpan,
+        calls_by_caller: &HashMap<SymbolId, Vec<ProgramCall>>,
+        definitions: &BTreeMap<SymbolId, CallableDefinition>,
+        parameter_values: &ParameterValues,
+        return_values: &ReturnValues,
+        capture_values: &CaptureValues,
+        lambda_creations: &[LambdaCreation],
+        external_unknown: bool,
+    ) -> ProgramAnalysis {
+        let mut result = ProgramAnalysis {
+            parameters: definitions
+                .iter()
+                .map(|(id, definition)| (id.clone(), vec![None; definition.parameters.len()]))
+                .collect(),
+            ..Default::default()
+        };
+
+        for (public_id, definition) in definitions {
+            let graph = definition.graph.as_ref();
+            let mut initial = graph
+                .all_locals()
+                .into_iter()
+                .map(|local| (local, CallableValue::default()))
+                .collect::<CallableState>();
+            let values = parameter_values.get(public_id);
+            for (index, &parameter) in definition.parameters.iter().enumerate() {
+                initial.insert(
+                    parameter,
+                    values
+                        .and_then(|values| values.get(index))
+                        .and_then(Clone::clone)
+                        .unwrap_or_else(|| {
+                            if external_unknown {
+                                CallableValue::default()
+                            } else {
+                                CallableValue::bottom()
+                            }
+                        }),
+                );
+            }
+            for &capture in &definition.captures {
+                initial.insert(
+                    capture,
+                    capture_values
+                        .get(public_id)
+                        .and_then(|values| values.get(&capture))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            if external_unknown {
+                                CallableValue::default()
+                            } else {
+                                CallableValue::bottom()
+                            }
+                        }),
+                );
+            }
+            let states = self.callable_states(
+                definition.file_id,
+                graph,
+                resolved_by_span,
+                initial,
+                return_values,
+            );
+            result.returns.insert(
+                public_id.clone(),
+                self.callable_return_value(
+                    definition.file_id,
+                    graph,
+                    &states,
+                    resolved_by_span,
+                    return_values,
+                ),
+            );
+
+            for creation in lambda_creations
+                .iter()
+                .filter(|creation| creation.owner == *public_id)
+            {
+                let Some(flow_node) = containing_flow_node(graph, creation.span) else {
+                    continue;
+                };
+                let Some(state) = states[flow_node.id.index()].as_ref() else {
+                    continue;
+                };
+                let Some(lambda) = definitions.get(&creation.lambda) else {
+                    continue;
+                };
+                for &capture in &lambda.captures {
+                    let value = state.get(&capture).cloned().unwrap_or_else(|| {
+                        if external_unknown {
+                            CallableValue::default()
+                        } else {
+                            CallableValue::bottom()
+                        }
+                    });
+                    let values = result.captures.entry(creation.lambda.clone()).or_default();
+                    let current = values.entry(capture).or_insert_with(CallableValue::bottom);
+                    *current = merged_callable_value(current, &value);
+                }
+            }
+
+            for call in calls_by_caller.get(public_id).into_iter().flatten() {
+                let Some(flow_node) = containing_flow_node(graph, call.span) else {
+                    continue;
+                };
+                let Some(state) = states[flow_node.id.index()].as_ref() else {
+                    continue;
+                };
+                let Some(file) = self.file_db.get_by_id(call.file_id) else {
+                    continue;
+                };
+                let Some(call_node) = file.find_node_at_span(call.span) else {
+                    continue;
+                };
+                let Some(callee) = call_node.child_by_field_name("callee") else {
+                    continue;
+                };
+                let direct = self.direct_callable_target(call.file_id, callee, resolved_by_span);
+                let value = direct.as_ref().map_or_else(
+                    || {
+                        self.callable_value(
+                            call.file_id,
+                            callee,
+                            state,
+                            resolved_by_span,
+                            return_values,
+                        )
+                    },
+                    |target| CallableValue::target(target.clone()),
+                );
+                let dispatch = if direct.is_some() {
+                    "direct"
+                } else {
+                    "indirect"
+                };
+                result.call_sites.push(CallSite {
+                    caller: public_id.clone(),
+                    location: self.location(call.file_id, call.span.start(), call.span.end()),
+                    node_id: self.exact_node(call.file_id, call.span),
+                    dispatch: dispatch.into(),
+                    targets: value.targets.iter().cloned().collect(),
+                    complete: !value.bottom && value.complete,
+                });
+
+                let arguments = self.call_argument_values(
+                    call.file_id,
+                    call_node,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    direct.as_deref(),
+                    definitions,
+                );
+                for target in &value.targets {
+                    let Some(slots) = result.parameters.get_mut(target) else {
+                        continue;
+                    };
+                    for (slot, argument) in slots.iter_mut().zip(&arguments) {
+                        merge_optional_callable_value(slot, argument);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn callable_return_value(
+        &self,
+        file_id: FileId,
+        graph: &ActonControlFlowGraph,
+        states: &[Option<CallableState>],
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+    ) -> CallableValue {
+        let Some(file) = self.file_db.get_by_id(file_id) else {
+            return CallableValue::default();
+        };
+        let mut returned = None;
+        let mut has_return = false;
+        for flow_node in graph
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == ActonFlowNodeKind::Return)
+        {
+            let Some(state) = states[flow_node.id.index()].as_ref() else {
+                continue;
+            };
+            has_return = true;
+            let value = flow_node
+                .span
+                .and_then(|span| file.find_node_at_span(span))
+                .and_then(|node| node.child_by_field_name("body"))
+                .map(|expression| {
+                    self.callable_value(file_id, expression, state, resolved_by_span, return_values)
+                })
+                .unwrap_or_else(CallableValue::non_callable);
+            merge_optional_callable_value(&mut returned, &value);
+        }
+        if has_return {
+            returned.unwrap_or_else(CallableValue::non_callable)
+        } else {
+            CallableValue::non_callable()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_argument_values(
+        &self,
+        file_id: FileId,
+        call: Node<'_>,
+        state: &CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+        direct: Option<&str>,
+        definitions: &BTreeMap<SymbolId, CallableDefinition>,
+    ) -> Vec<CallableValue> {
+        let mut values = vec![];
+        if let Some(target) = direct
+            .and_then(|target| definitions.get(target))
+            .and_then(|definition| definition.acton_symbol)
+            .and_then(|symbol| self.project.resolve_symbol(symbol))
+            && matches!(
+                target.kind,
+                SymbolKind::Method {
+                    is_instance: true,
+                    ..
+                }
+            )
+            && let Some(receiver) = call
+                .child_by_field_name("callee")
+                .and_then(|callee| callee.child_by_field_name("obj"))
+        {
+            values.push(self.callable_value(
+                file_id,
+                receiver,
+                state,
+                resolved_by_span,
+                return_values,
+            ));
+        }
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return values;
+        };
+        let mut cursor = arguments.walk();
+        for argument in arguments.named_children(&mut cursor) {
+            let Some(expression) = argument.child_by_field_name("expr") else {
+                continue;
+            };
+            values.push(self.callable_value(
+                file_id,
+                expression,
+                state,
+                resolved_by_span,
+                return_values,
+            ));
+        }
+        values
     }
 
     fn callable_states(
@@ -879,12 +1576,9 @@ impl<'a> SnapshotBuilder<'a> {
         file_id: FileId,
         graph: &ActonControlFlowGraph,
         resolved_by_span: &ResolutionsBySpan,
+        initial: CallableState,
+        return_values: &ReturnValues,
     ) -> Vec<Option<CallableState>> {
-        let initial = graph
-            .all_locals()
-            .into_iter()
-            .map(|local| (local, CallableValue::default()))
-            .collect::<CallableState>();
         let mut incoming = vec![None; graph.node_count()];
         incoming[graph.entry().index()] = Some(initial);
         let mut work = VecDeque::from([graph.entry()]);
@@ -898,6 +1592,7 @@ impl<'a> SnapshotBuilder<'a> {
                 graph.node(node_id),
                 &state,
                 resolved_by_span,
+                return_values,
             );
 
             for edge in graph.successors(node_id) {
@@ -928,6 +1623,7 @@ impl<'a> SnapshotBuilder<'a> {
         flow_node: &tolk_dataflow::FlowNode,
         incoming: &CallableState,
         resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
     ) -> CallableState {
         let mut outgoing = incoming.clone();
         let Some(span) = flow_node.span else {
@@ -940,17 +1636,24 @@ impl<'a> SnapshotBuilder<'a> {
         let assigned = assignment.and_then(|node| {
             let left = node.child_by_field_name("left")?;
             let right = node.child_by_field_name("right")?;
-            let local = self.local_assignment_target(file_id, left, flow_node, resolved_by_span)?;
-            let value = self.callable_value(file_id, right, incoming, resolved_by_span);
-            Some((local, value))
+            let path = self.local_assignment_target(file_id, left, flow_node, resolved_by_span)?;
+            let value =
+                self.callable_value(file_id, right, incoming, resolved_by_span, return_values);
+            Some((path, value))
         });
 
         // Any unmodelled write may replace a callable value, so invalidate it first.
         for local in &flow_node.writes {
             outgoing.insert(*local, CallableValue::default());
         }
-        if let Some((local, value)) = assigned {
-            outgoing.insert(local, value);
+        if let Some((path, value)) = assigned {
+            if path.members.is_empty() {
+                outgoing.insert(path.root, value);
+            } else {
+                let mut root = incoming.get(&path.root).cloned().unwrap_or_default();
+                root.set_member_path(&path.members, value);
+                outgoing.insert(path.root, root);
+            }
         }
         outgoing
     }
@@ -961,10 +1664,13 @@ impl<'a> SnapshotBuilder<'a> {
         node: Node<'_>,
         flow_node: &tolk_dataflow::FlowNode,
         resolved_by_span: &ResolutionsBySpan,
-    ) -> Option<tolk_resolver::resolve_index::LocalDefId> {
+    ) -> Option<LocalPath> {
         match node.kind() {
             "identifier" => match self.resolved_node(file_id, node, resolved_by_span)? {
-                Resolved::Local(local) => Some(*local),
+                Resolved::Local(local) => Some(LocalPath {
+                    root: *local,
+                    members: vec![],
+                }),
                 Resolved::Global(_) | Resolved::Unresolved => None,
             },
             "parenthesized_expression" => self.local_assignment_target(
@@ -973,8 +1679,25 @@ impl<'a> SnapshotBuilder<'a> {
                 flow_node,
                 resolved_by_span,
             ),
-            "var_declaration_lhs" if flow_node.writes.len() == 1 => {
-                flow_node.writes.iter().next().copied()
+            "var_declaration_lhs" if flow_node.writes.len() == 1 => flow_node
+                .writes
+                .iter()
+                .next()
+                .copied()
+                .map(|root| LocalPath {
+                    root,
+                    members: vec![],
+                }),
+            "dot_access" => {
+                let mut path = self.local_assignment_target(
+                    file_id,
+                    node.child_by_field_name("obj")?,
+                    flow_node,
+                    resolved_by_span,
+                )?;
+                path.members
+                    .push(self.node_text(file_id, node.child_by_field_name("field")?)?);
+                Some(path)
             }
             _ => None,
         }
@@ -986,58 +1709,249 @@ impl<'a> SnapshotBuilder<'a> {
         node: Node<'_>,
         state: &CallableState,
         resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
     ) -> CallableValue {
+        self.callable_value_depth(file_id, node, state, resolved_by_span, return_values, 0)
+    }
+
+    fn callable_value_depth(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        state: &CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+        depth: usize,
+    ) -> CallableValue {
+        if depth >= 12 {
+            return CallableValue::default();
+        }
+        if let Some(target) = self.direct_callable_target(file_id, node, resolved_by_span) {
+            return CallableValue::target(target);
+        }
         match node.kind() {
             "identifier" => match self.resolved_node(file_id, node, resolved_by_span) {
-                Some(Resolved::Global(symbol)) if self.is_callable_symbol(*symbol) => {
-                    CallableValue {
-                        targets: BTreeSet::from([*symbol]),
-                        complete: true,
-                    }
-                }
                 Some(Resolved::Local(local)) => state.get(local).cloned().unwrap_or_default(),
                 Some(Resolved::Global(_)) | Some(Resolved::Unresolved) | None => {
                     CallableValue::default()
                 }
             },
-            "dot_access" => node
-                .child_by_field_name("field")
-                .and_then(|field| self.resolved_node(file_id, field, resolved_by_span))
-                .and_then(|resolved| match resolved {
-                    Resolved::Global(symbol) if self.is_callable_symbol(*symbol) => {
-                        Some(CallableValue {
-                            targets: BTreeSet::from([*symbol]),
-                            complete: true,
-                        })
-                    }
-                    Resolved::Global(_) | Resolved::Local(_) | Resolved::Unresolved => None,
-                })
+            "lambda_expression" => self
+                .lambda_ids
+                .get(&(file_id, node.start_byte() as u32, node.end_byte() as u32))
+                .cloned()
+                .map(CallableValue::target)
                 .unwrap_or_default(),
+            "function_call" => {
+                let Some(callee) = node.child_by_field_name("callee") else {
+                    return CallableValue::default();
+                };
+                let called = self.callable_value_depth(
+                    file_id,
+                    callee,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    depth + 1,
+                );
+                if called.bottom {
+                    return CallableValue::bottom();
+                }
+                let mut returned = None;
+                for target in &called.targets {
+                    let value = return_values.get(target).cloned().unwrap_or_default();
+                    merge_optional_callable_value(&mut returned, &value);
+                }
+                let mut returned = returned.unwrap_or_default();
+                returned.complete &= called.complete;
+                returned.members_complete &= called.complete;
+                returned.limit_member_depth(12 - depth);
+                returned
+            }
+            "dot_access" => {
+                let Some(object) = node.child_by_field_name("obj") else {
+                    return CallableValue::default();
+                };
+                let Some(field) = node.child_by_field_name("field") else {
+                    return CallableValue::default();
+                };
+                let object = self.callable_value_depth(
+                    file_id,
+                    object,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    depth + 1,
+                );
+                let key = self.node_text(file_id, field).unwrap_or_default();
+                object.member(&key)
+            }
             "generic_instantiation" => node
                 .child_by_field_name("expr")
-                .map(|inner| self.callable_value(file_id, inner, state, resolved_by_span))
+                .map(|inner| {
+                    self.callable_value_depth(
+                        file_id,
+                        inner,
+                        state,
+                        resolved_by_span,
+                        return_values,
+                        depth + 1,
+                    )
+                })
                 .unwrap_or_default(),
             "parenthesized_expression" | "not_null_operator" => node
                 .child_by_field_name("inner")
-                .map(|inner| self.callable_value(file_id, inner, state, resolved_by_span))
+                .map(|inner| {
+                    self.callable_value_depth(
+                        file_id,
+                        inner,
+                        state,
+                        resolved_by_span,
+                        return_values,
+                        depth + 1,
+                    )
+                })
                 .unwrap_or_default(),
             "cast_as_operator" => node
                 .child_by_field_name("expr")
-                .map(|inner| self.callable_value(file_id, inner, state, resolved_by_span))
+                .map(|inner| {
+                    self.callable_value_depth(
+                        file_id,
+                        inner,
+                        state,
+                        resolved_by_span,
+                        return_values,
+                        depth + 1,
+                    )
+                })
                 .unwrap_or_default(),
             "ternary_operator" => {
                 let consequence = node
                     .child_by_field_name("consequence")
-                    .map(|branch| self.callable_value(file_id, branch, state, resolved_by_span))
+                    .map(|branch| {
+                        self.callable_value_depth(
+                            file_id,
+                            branch,
+                            state,
+                            resolved_by_span,
+                            return_values,
+                            depth + 1,
+                        )
+                    })
                     .unwrap_or_default();
                 let alternative = node
                     .child_by_field_name("alternative")
-                    .map(|branch| self.callable_value(file_id, branch, state, resolved_by_span))
+                    .map(|branch| {
+                        self.callable_value_depth(
+                            file_id,
+                            branch,
+                            state,
+                            resolved_by_span,
+                            return_values,
+                            depth + 1,
+                        )
+                    })
                     .unwrap_or_default();
                 merged_callable_value(&consequence, &alternative)
             }
+            "tensor_expression" | "typed_tuple" => {
+                let mut value = CallableValue::non_callable();
+                value.members_complete = true;
+                let mut cursor = node.walk();
+                for (index, element) in node.named_children(&mut cursor).enumerate() {
+                    value.members.insert(
+                        index.to_string(),
+                        self.callable_value_depth(
+                            file_id,
+                            element,
+                            state,
+                            resolved_by_span,
+                            return_values,
+                            depth + 1,
+                        ),
+                    );
+                }
+                value
+            }
+            "object_literal" => {
+                let mut value = CallableValue::non_callable();
+                value.members_complete = true;
+                let Some(arguments) = node.child_by_field_name("arguments") else {
+                    return value;
+                };
+                let mut cursor = arguments.walk();
+                for argument in arguments.named_children(&mut cursor) {
+                    let Some(name) = argument.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let key = self.node_text(file_id, name).unwrap_or_default();
+                    let member = argument
+                        .child_by_field_name("value")
+                        .map(|member| {
+                            self.callable_value_depth(
+                                file_id,
+                                member,
+                                state,
+                                resolved_by_span,
+                                return_values,
+                                depth + 1,
+                            )
+                        })
+                        .unwrap_or_default();
+                    value.members.insert(key, member);
+                }
+                value
+            }
+            "number_literal" | "string_literal" | "boolean_literal" | "null_literal" => {
+                CallableValue::non_callable()
+            }
             _ => CallableValue::default(),
         }
+    }
+
+    fn direct_callable_target(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        resolved_by_span: &ResolutionsBySpan,
+    ) -> Option<SymbolId> {
+        match node.kind() {
+            "identifier" => match self.resolved_node(file_id, node, resolved_by_span)? {
+                Resolved::Global(symbol) if self.is_callable_symbol(*symbol) => {
+                    self.symbol_ids.get(symbol).cloned()
+                }
+                Resolved::Global(_) | Resolved::Local(_) | Resolved::Unresolved => None,
+            },
+            "dot_access" => {
+                let field = node.child_by_field_name("field")?;
+                match self.resolved_node(file_id, field, resolved_by_span)? {
+                    Resolved::Global(symbol) if self.is_callable_symbol(*symbol) => {
+                        self.symbol_ids.get(symbol).cloned()
+                    }
+                    Resolved::Global(_) | Resolved::Local(_) | Resolved::Unresolved => None,
+                }
+            }
+            "generic_instantiation" | "cast_as_operator" => self.direct_callable_target(
+                file_id,
+                node.child_by_field_name("expr")?,
+                resolved_by_span,
+            ),
+            "parenthesized_expression" | "not_null_operator" => self.direct_callable_target(
+                file_id,
+                node.child_by_field_name("inner")?,
+                resolved_by_span,
+            ),
+            _ => None,
+        }
+    }
+
+    fn node_text(&self, file_id: FileId, node: Node<'_>) -> Option<String> {
+        self.file_db
+            .get_by_id(file_id)?
+            .source()
+            .source
+            .get(node.start_byte()..node.end_byte())
+            .map(str::to_owned)
     }
 
     fn resolved_node<'b>(
@@ -1216,6 +2130,19 @@ impl<'a> SnapshotBuilder<'a> {
                     graph.as_ref(),
                 ));
             }
+            for (&(file_id, start, end), public_symbol_id) in &self.lambda_ids {
+                if file_id != file.id {
+                    continue;
+                }
+                let Some(graph) = self.lambda_cfg(file_id, Span { start, end }) else {
+                    continue;
+                };
+                graphs.push(self.convert_control_flow_graph(
+                    file_id,
+                    public_symbol_id.clone(),
+                    graph.as_ref(),
+                ));
+            }
         }
         graphs.sort_by(|left, right| left.symbol_id.cmp(&right.symbol_id));
         graphs
@@ -1286,24 +2213,6 @@ impl<'a> SnapshotBuilder<'a> {
             if node.kind() == "function_call" {
                 let callee = node.child_by_field_name("callee")?;
                 if callee.start_byte() <= span.start() && callee.end_byte() >= span.end() {
-                    return Some(Span {
-                        start: node.start_byte() as u32,
-                        end: node.end_byte() as u32,
-                    });
-                }
-                return None;
-            }
-            node = node.parent()?;
-        }
-    }
-
-    fn call_target_node(&self, file_id: FileId, span: Span) -> Option<Span> {
-        let info = self.file_db.get_by_id(file_id)?;
-        let mut node = info.find_node_at_span(span)?;
-        loop {
-            if node.kind() == "function_call" {
-                let callee = node.child_by_field_name("callee")?;
-                if is_callable_reference(callee, span) {
                     return Some(Span {
                         start: node.start_byte() as u32,
                         end: node.end_byte() as u32,
@@ -1627,20 +2536,62 @@ fn point_to_byte(source: &str, row: usize, column: usize) -> usize {
     (line_start + column).min(source.len())
 }
 
-fn is_callable_reference(node: Node<'_>, span: Span) -> bool {
-    match node.kind() {
-        "identifier" => node.start_byte() <= span.start() && node.end_byte() >= span.end(),
-        "generic_instantiation" => node
-            .child_by_field_name("expr")
-            .is_some_and(|inner| is_callable_reference(inner, span)),
-        "parenthesized_expression" | "not_null_operator" => node
-            .child_by_field_name("inner")
-            .is_some_and(|inner| is_callable_reference(inner, span)),
-        "dot_access" => node.child_by_field_name("field").is_some_and(|field| {
-            field.start_byte() <= span.start() && field.end_byte() >= span.end()
-        }),
-        _ => false,
+fn collect_owned_call_nodes(
+    node: Node<'_>,
+    file_id: FileId,
+    owner: &SymbolId,
+    lambda_ids: &HashMap<(FileId, u32, u32), SymbolId>,
+    calls: &mut Vec<ProgramCall>,
+    creations: &mut Vec<LambdaCreation>,
+) {
+    if node.kind() == "lambda_expression" {
+        let span = Span {
+            start: node.start_byte() as u32,
+            end: node.end_byte() as u32,
+        };
+        let Some(lambda) = lambda_ids.get(&(file_id, span.start, span.end)) else {
+            return;
+        };
+        creations.push(LambdaCreation {
+            file_id,
+            owner: owner.clone(),
+            lambda: lambda.clone(),
+            span,
+        });
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_owned_call_nodes(child, file_id, lambda, lambda_ids, calls, creations);
+        }
+        return;
     }
+    if node.kind() == "function_call" {
+        calls.push(ProgramCall {
+            file_id,
+            caller: owner.clone(),
+            span: Span {
+                start: node.start_byte() as u32,
+                end: node.end_byte() as u32,
+            },
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_owned_call_nodes(child, file_id, owner, lambda_ids, calls, creations);
+    }
+}
+
+fn containing_flow_node(
+    graph: &ActonControlFlowGraph,
+    span: Span,
+) -> Option<&tolk_dataflow::FlowNode> {
+    graph
+        .nodes()
+        .iter()
+        .filter(|node| {
+            node.span
+                .is_some_and(|node_span| node_span.start <= span.start && node_span.end >= span.end)
+        })
+        .min_by_key(|node| node.span.map_or(u32::MAX, |span| span.end - span.start))
 }
 
 fn reference_key(reference: &Reference) -> (&str, u32, u32, &str) {
@@ -1652,10 +2603,53 @@ fn reference_key(reference: &Reference) -> (&str, u32, u32, &str) {
     )
 }
 fn merged_callable_value(left: &CallableValue, right: &CallableValue) -> CallableValue {
-    CallableValue {
-        targets: left.targets.union(&right.targets).copied().collect(),
-        complete: left.complete && right.complete,
+    if left.bottom {
+        return right.clone();
     }
+    if right.bottom {
+        return left.clone();
+    }
+    let mut members = BTreeMap::new();
+    for key in left.members.keys().chain(right.members.keys()) {
+        if members.contains_key(key) {
+            continue;
+        }
+        let value = match (left.members.get(key), right.members.get(key)) {
+            (Some(left), Some(right)) => merged_callable_value(left, right),
+            (Some(left), None) => merged_callable_value(
+                left,
+                &if right.members_complete {
+                    CallableValue::non_callable()
+                } else {
+                    CallableValue::default()
+                },
+            ),
+            (None, Some(right)) => merged_callable_value(
+                &if left.members_complete {
+                    CallableValue::non_callable()
+                } else {
+                    CallableValue::default()
+                },
+                right,
+            ),
+            (None, None) => continue,
+        };
+        members.insert(key.clone(), value);
+    }
+    CallableValue {
+        targets: left.targets.union(&right.targets).cloned().collect(),
+        complete: left.complete && right.complete,
+        members,
+        members_complete: left.members_complete && right.members_complete,
+        bottom: false,
+    }
+}
+
+fn merge_optional_callable_value(current: &mut Option<CallableValue>, incoming: &CallableValue) {
+    *current = Some(match current.take() {
+        Some(current) => merged_callable_value(&current, incoming),
+        None => incoming.clone(),
+    });
 }
 
 fn merge_callable_states(current: &mut CallableState, incoming: &CallableState) -> bool {
@@ -1746,6 +2740,33 @@ mod tests {
             control_flow: ControlFlowScope::Workspace,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn callable_lattice_distinguishes_bottom_unknown_and_nested_shapes() {
+        let target = CallableValue::target("callable".into());
+        assert_eq!(
+            merged_callable_value(&CallableValue::bottom(), &target),
+            target
+        );
+
+        let partial = merged_callable_value(&CallableValue::default(), &target);
+        assert_eq!(partial.targets, BTreeSet::from(["callable".into()]));
+        assert!(!partial.complete);
+
+        let mut shape = CallableValue::bottom();
+        shape.set_member_path(&["outer".into(), "handler".into()], target.clone());
+        assert_eq!(shape.member("outer").member("handler"), target);
+        assert!(!shape.member("missing").complete);
+
+        shape.limit_member_depth(1);
+        let truncated = shape.member("outer").member("handler");
+        assert!(truncated.targets.is_empty());
+        assert!(!truncated.complete);
+
+        let mut exact = CallableValue::non_callable();
+        exact.members_complete = true;
+        assert!(exact.member("missing").complete);
     }
 
     #[test]
@@ -2261,7 +3282,7 @@ fun viaTry(value: int): int {
     }
 
     #[test]
-    fn keeps_unmodeled_callable_origins_explicitly_incomplete() {
+    fn resolves_callables_from_returns_lambdas_and_containers() {
         let source = r#"
 fun first(value: int): int { return value; }
 fun second(value: int): int { return value + 1; }
@@ -2284,7 +3305,23 @@ fun viaContainer(value: int): int {
 }
 "#;
         let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
-        for caller_name in ["viaReturn", "viaLambda", "viaContainer"] {
+        let first = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "first" && !symbol.flags.local)
+            .expect("first symbol");
+        let lambda = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "lambda")
+            .expect("lambda symbol");
+        assert!(lambda.flags.local);
+
+        for (caller_name, target) in [
+            ("viaReturn", &first.id),
+            ("viaLambda", &lambda.id),
+            ("viaContainer", &first.id),
+        ] {
             let caller = snapshot
                 .symbols
                 .iter()
@@ -2294,16 +3331,407 @@ fun viaContainer(value: int): int {
                 .call_sites
                 .iter()
                 .find(|call_site| call_site.caller == caller.id && call_site.dispatch == "indirect")
-                .expect("unknown indirect call site");
-            assert!(!call_site.complete);
-            assert!(call_site.targets.is_empty());
+                .expect("resolved indirect call site");
+            assert!(call_site.complete);
+            assert_eq!(call_site.targets.len(), 1);
+            assert_eq!(&call_site.targets[0], target);
             assert!(
-                !snapshot
+                snapshot
                     .call_graph
                     .iter()
-                    .any(|edge| { edge.caller == caller.id && edge.dispatch == "indirect" })
+                    .any(|edge| edge.caller == caller.id && edge.callee == **target)
             );
         }
+    }
+
+    #[test]
+    fn resolves_callbacks_through_recursive_forwarding_and_merged_callers() {
+        let source = r#"
+fun first(value: int): int { return value + 1; }
+fun second(value: int): int { return value + 2; }
+
+fun select(flag: bool): ((int) -> int) {
+    return flag ? first : second;
+}
+
+fun bounce(callback: ((int) -> int), recurse: bool): ((int) -> int) {
+    if (recurse) {
+        return bounce(callback, false);
+    }
+    return callback;
+}
+
+fun invoke(callback: ((int) -> int), value: int): int {
+    return callback(value);
+}
+
+fun primary(flag: bool, value: int): int {
+    val selected = select(flag);
+    val forwarded = bounce(selected, true);
+    val firstResult = forwarded(value);
+    return invoke(selected, firstResult);
+}
+
+fun secondary(value: int): int {
+    return invoke(second, value);
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let expected = BTreeSet::from([global("first").id.clone(), global("second").id.clone()]);
+        for caller_name in ["primary", "invoke"] {
+            let caller = global(caller_name);
+            let call = snapshot
+                .call_sites
+                .iter()
+                .find(|call| call.caller == caller.id && call.dispatch == "indirect")
+                .expect("indirect callback invocation");
+            assert!(call.complete, "{caller_name} should be fully resolved");
+            assert_eq!(
+                call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_nested_containers_across_generic_parameter_and_return_boundaries() {
+        let source = r#"
+fun first(value: int): int { return value + 1; }
+fun second(value: int): int { return value + 2; }
+fun identity<T>(value: T): T { return value; }
+
+fun audit(flag: bool, value: int): int {
+    val routes = flag
+        ? ((first, second), (second, first))
+        : ((second, first), (first, second));
+    val forwarded = identity(routes);
+    val primary = forwarded.0.1;
+    val fallback = forwarded.1.0;
+    return primary(fallback(value));
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let audit = global("audit");
+        let expected = BTreeSet::from([global("first").id.clone(), global("second").id.clone()]);
+        let indirect = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| call.caller == audit.id && call.dispatch == "indirect")
+            .collect::<Vec<_>>();
+        assert_eq!(indirect.len(), 2);
+        for call in indirect {
+            assert!(call.complete);
+            assert_eq!(
+                call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_returned_lambdas_in_locals_and_immediate_invocations() {
+        let source = r#"
+fun make(offset: int): ((int) -> int) {
+    return fun (value: int): int { return value + offset; };
+}
+
+fun audit(value: int): int {
+    val callback = make(1);
+    val firstResult = callback(value);
+    return make(2)(firstResult);
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let audit = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "audit" && !symbol.flags.local)
+            .expect("audit symbol");
+        let lambda = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "lambda")
+            .expect("lambda symbol");
+        let lambda_parameter = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == "value"
+                    && symbol.flags.parameter
+                    && symbol.containing_symbol.as_ref() == Some(&lambda.id)
+            })
+            .expect("lambda parameter symbol");
+        assert!(lambda_parameter.flags.local);
+        let indirect = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| call.caller == audit.id && call.dispatch == "indirect")
+            .collect::<Vec<_>>();
+        assert_eq!(indirect.len(), 2);
+        for call in indirect {
+            assert!(call.complete);
+            assert_eq!(call.targets, vec![lambda.id.clone()]);
+        }
+    }
+
+    #[test]
+    fn attributes_captured_callback_calls_and_control_flow_to_lambda() {
+        let source = r#"
+fun allow(value: int): int { return value; }
+fun reject(value: int): int { throw value; }
+
+fun factory(flag: bool): ((int) -> int) {
+    var captured = allow;
+    if (flag) {
+        captured = reject;
+    }
+    return fun (value: int): int {
+        var callback = captured;
+        var remaining = value;
+        while (remaining > 0) {
+            callback = captured;
+            remaining -= 1;
+        }
+        return callback(remaining);
+    };
+}
+
+fun audit(flag: bool, value: int): int {
+    return factory(flag)(value);
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let symbol = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let lambda = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "lambda")
+            .expect("lambda symbol");
+        let callback_call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| call.caller == lambda.id && call.dispatch == "indirect")
+            .expect("captured callback call");
+        assert!(callback_call.complete);
+        assert_eq!(
+            callback_call
+                .targets
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([symbol("allow").id.clone(), symbol("reject").id.clone()])
+        );
+
+        let graph = snapshot
+            .control_flow_graphs
+            .iter()
+            .find(|graph| graph.symbol_id == lambda.id)
+            .expect("lambda CFG");
+        assert!(graph.edges.iter().any(|edge| edge.kind == "loopBack"));
+        let captured = snapshot
+            .symbols
+            .iter()
+            .find(|candidate| candidate.name == "captured")
+            .expect("captured local symbol");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.reads.contains(&captured.id))
+        );
+    }
+
+    #[test]
+    fn resolves_nested_lambda_parameters_and_transitive_captures() {
+        let source = r#"
+fun allow(value: int): int { return value + 1; }
+fun reject(value: int): int { return value + 2; }
+
+fun makeBinder() {
+    return fun (callback: ((int) -> int)): ((int) -> int) {
+        return fun (value: int): int {
+            return callback(value);
+        };
+    };
+}
+
+fun audit(value: int): int {
+    val binder = makeBinder();
+    val first = binder(allow);
+    val second = binder(reject);
+    return first(value) + second(value);
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let globals = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let mut lambdas = snapshot
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "lambda")
+            .collect::<Vec<_>>();
+        lambdas.sort_by_key(|lambda| lambda.declaration.byte_range.start);
+        assert_eq!(lambdas.len(), 2);
+        assert_eq!(lambdas[1].containing_symbol.as_ref(), Some(&lambdas[0].id));
+
+        let inner_call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| call.caller == lambdas[1].id)
+            .expect("inner lambda callback call");
+        assert!(inner_call.complete);
+        assert_eq!(
+            inner_call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([globals("allow").id.clone(), globals("reject").id.clone(),])
+        );
+
+        for lambda in lambdas {
+            assert!(
+                snapshot
+                    .control_flow_graphs
+                    .iter()
+                    .any(|graph| graph.symbol_id == lambda.id)
+            );
+        }
+    }
+
+    #[test]
+    fn captures_callable_values_at_lambda_creation_time() {
+        let source = r#"
+fun allow(value: int): int { return value; }
+fun reject(value: int): int { return value + 1; }
+
+fun audit(value: int): int {
+    var action = allow;
+    val callback = fun (inner: int): int {
+        return action(inner);
+    };
+    action = reject;
+    return callback(value);
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let lambda = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "lambda")
+            .expect("lambda symbol");
+        let allow = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "allow" && !symbol.flags.local)
+            .expect("allow symbol");
+        let call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| call.caller == lambda.id)
+            .expect("captured call");
+        assert!(call.complete);
+        assert_eq!(call.targets, vec![allow.id.clone()]);
+    }
+
+    #[test]
+    fn resolves_callback_flow_across_file_and_struct_field_boundaries() {
+        let library = r#"
+struct Handlers {
+    primary: ((int) -> int)
+    fallback: ((int) -> int)
+}
+
+fun forward<T>(value: T): T { return value; }
+"#;
+        let application = r#"
+import "handlers";
+
+fun allow(value: int): int { return value; }
+fun reject(value: int): int { throw value; }
+
+fun audit(flag: bool, value: int): int {
+    var handlers = Handlers { primary: allow, fallback: reject };
+    if (flag) {
+        handlers.primary = reject;
+    }
+    val forwarded = forward(handlers);
+    return forwarded.primary(value);
+}
+"#;
+        let snapshot = project(
+            &[
+                ("/project/handlers.tolk", library),
+                ("/project/main.tolk", application),
+            ],
+            &["/project/main.tolk"],
+        );
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let audit = global("audit");
+        let call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| call.caller == audit.id && call.dispatch == "indirect")
+            .expect("struct-held callback call");
+        assert!(call.complete);
+        assert_eq!(
+            call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([global("allow").id.clone(), global("reject").id.clone()])
+        );
+    }
+
+    #[test]
+    fn leaves_a_truly_external_callback_origin_incomplete() {
+        let source = r#"
+fun forward(callback: ((int) -> int)): ((int) -> int) {
+    return callback;
+}
+
+fun publicEntry(callback: ((int) -> int), value: int): int {
+    val returned = forward(callback);
+    return returned(value);
+}
+"#;
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        let entry = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "publicEntry" && !symbol.flags.local)
+            .expect("entry symbol");
+        let call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| call.caller == entry.id && call.dispatch == "indirect")
+            .expect("external callback call site");
+        assert!(!call.complete);
+        assert!(call.targets.is_empty());
     }
 
     #[test]

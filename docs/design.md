@@ -27,11 +27,15 @@ References retain value/type namespace and call context alongside combinable
 read/write/mutate facts from Acton's `tolk-analysis`. `constantValue` evaluates constant
 and enum-member symbols without losing integer precision.
 
-Per-function control-flow graphs retain branch/loop/return/throw edge kinds, source
+Per-callable control-flow graphs retain branch/loop/return/throw edge kinds, source
 locations, AST links, and local read/write sets without leaking Acton's internal IDs.
 They are separate from, and complementary to, the inter-function call graph. Workspace
 CFGs are included by default; consumers can disable them or include dependency graphs.
 See [control-flow analysis](control-flow.md) for the public contract and usage examples.
+
+Lambda CFGs reuse Acton's public function CFG builder through a local AST adapter. No
+Acton source is copied or forked. Lambda parameters and by-value captures are connected to
+the whole-program callable fixed point by `tolk-inspect`.
 
 `TypeInfo` exposes the major type kind, referenced declaration, element types, and
 function return type. Exact constant values belong to `constantValue`; lower-level Acton
@@ -45,10 +49,9 @@ suppressions are honored. Dependency sources remain inspectable but are not lint
 
 - Official C++ compiler diagnostics require a separate compiler backend and are not
   available in the current WASM build.
-- Calls through function-valued locals are resolved across direct assignments, copies,
-  branches, and loops. Values originating from callback parameters, function returns,
-  lambdas, or containers may remain partially or wholly unresolved; `callSites()` marks
-  those results with `complete: false` rather than inventing a target.
+- Callable flow is context-insensitive, so separate calls to one helper merge their
+  possible targets. Externally supplied callbacks and values produced by opaque runtime,
+  builtin, array, or map operations remain incomplete.
 - The API is snapshot-based; incremental updates require constructing another snapshot.
 
 ## Toolchain note

@@ -72,10 +72,14 @@ by Acton's `tolk-analysis`, in addition to their syntactic usage and namespace.
 `constantValue` evaluates constant and enum-member symbols; integer values are decimal
 strings so values outside JavaScript's safe-integer range remain exact.
 
-Calls through local function values are resolved conservatively across assignments,
-local-to-local copies, branches, and loops. `callSites()` is the authoritative view of
-dispatch and resolution completeness; `callGraph()`, `calls()`, and `callers()` flatten
-every discovered target into an edge.
+Calls through function values are resolved conservatively across assignments, copies,
+branches, loops, callback parameters, function returns, recursion, lambdas, and nested
+tuple/object fields. `callSites()` is the authoritative view of dispatch and resolution
+completeness; `callGraph()`, `calls()`, and `callers()` flatten every discovered target
+into an edge.
+
+Lambdas have stable synthetic symbols and their own CFGs. Calls inside lambda bodies are
+attributed to those symbols, including calls through parameters and by-value captures.
 
 ```ts
 for (const callSite of project.callSites()) {

@@ -21,11 +21,13 @@ Resolved references include `context.access` flags for precise read, write, and 
 classification backed by Acton's `tolk-analysis` crate.
 `project.constantValue(symbol)` evaluates constants and enum members, representing integer
 values as exact decimal strings.
-`project.controlFlow(symbol)` returns a navigable per-function CFG with reachability,
+`project.controlFlow(symbol)` returns a navigable per-callable CFG with reachability,
 dominance, source-location, AST-link, and local read/write information.
 `project.callSites()` exposes direct and indirect calls, possible global targets, and
-whether target resolution is complete. Call-graph edges include every conservatively
-resolved target of function-valued locals across copies, branches, and loops.
+whether target resolution is complete. Whole-program callable flow crosses copies,
+branches, loops, callback parameters, function returns, recursion, lambdas, and nested
+tuple/object fields. Lambda symbols own their internal call sites and CFGs, with callback
+captures modeled at creation time.
 `project.diagnostics()` includes Acton linter findings for workspace files with rule
 codes, annotations, help text, and structured fixes. Acton
 `check-disable-next-line` comments are honored.

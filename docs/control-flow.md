@@ -1,8 +1,9 @@
 # Control-flow analysis
 
-`tolk-inspect` exposes a control-flow graph (CFG) for each analyzed function, method, and
-get-method. Unlike the project call graph, which connects callers to callees, a CFG models
-the possible execution paths between expressions and statements inside one callable.
+`tolk-inspect` exposes a control-flow graph (CFG) for each analyzed function, method,
+get-method, and lambda. Unlike the project call graph, which connects callers to callees,
+a CFG models the possible execution paths between expressions and statements inside one
+callable.
 
 CFG generation is controlled when constructing the project:
 
