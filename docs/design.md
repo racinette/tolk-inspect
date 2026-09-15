@@ -49,8 +49,8 @@ suppressions are honored. Dependency sources remain inspectable but are not lint
 
 - Official C++ compiler diagnostics require a separate compiler backend and are not
   available in the current WASM build.
-- Externally supplied callbacks and values produced by opaque runtime or unmodeled builtin
-  operations remain incomplete.
+- Externally supplied callbacks and callable values produced by opaque FFI, runtime, or
+  deserialization operations remain incomplete because no source-level target is available.
 - The API is snapshot-based; incremental updates require constructing another snapshot.
 
 ## Toolchain note

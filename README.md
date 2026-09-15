@@ -97,7 +97,10 @@ controls the public CFG payload, not call-graph precision.
 
 Callable flow includes standard array/map storage and lookup. Constant indexes and keys stay
 precise; dynamic lookups produce a safe union of possible targets. Collection mutations are
-tracked through branches, loops, returns, and `mutate` helper parameters.
+tracked through branches, loops, returns, and `mutate` helper parameters. The complete core map
+mutation, previous/deleted-value, and ordered-iteration surface is modeled, as are low-level
+tuple/map round trips, tuple destructuring, and stdlib `lisp_list` operations. See the
+[callable-flow audit](docs/callable-flow-audit.md) for the exact boundary.
 `versionInfo()` reports the package, pinned Acton revision, and analyzer Tolk version.
 
 ## Build and test

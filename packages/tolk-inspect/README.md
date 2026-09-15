@@ -27,8 +27,9 @@ dominance, source-location, AST-link, and local read/write information.
 whether target resolution is complete. Whole-program callable flow crosses copies,
 branches, loops, callback parameters, function returns, recursion, lambdas, and nested
 tuple/object fields. Standard array/map storage, lookup, and mutation are also tracked,
-including constant and dynamic keys. Lambda symbols own their internal call sites and CFGs,
-with callback captures modeled at creation time.
+including previous/deleted values, ordered map traversal, constant and dynamic keys, low-level
+tuple/map round trips, tuple destructuring, and stdlib `lisp_list` operations. Lambda symbols own
+their internal call sites and CFGs, with callback captures modeled at creation time.
 `project.diagnostics()` includes Acton linter findings for workspace files with rule
 codes, annotations, help text, and structured fixes. Acton
 `check-disable-next-line` comments are honored.

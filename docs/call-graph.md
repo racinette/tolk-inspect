@@ -108,12 +108,27 @@ is the union of every reachable callee rather than a per-invocation result.
 
 Standard collection operations participate in the same CFG and whole-program fixed point.
 Array literals preserve exact positions; `get`, `first`, `last`, `set`, `push`, and `pop` carry
-callable values. Map `set`, `mustGet`, and `get(...).loadValue()` preserve values by key.
+callable values. Map lookup and mutation operations preserve values by key, including
+`setAndGetPrevious`, `replaceAndGetPrevious`, `addOrGetExisting`, and
+`deleteAndGetDeleted`. Ordered entry operations such as `findFirst` and `iterateNext` return
+the conservative union of callable values stored in the map.
 
 Literal and evaluated constant indexes/keys select one tracked entry. A dynamic index/key
 returns the union of all entries it may select, while a dynamic write is conservatively
 included in every compatible later lookup. Collection values and mutations also propagate
 through function parameters, returns, branches, loops, and `mutate` helper parameters.
+
+`createEmptyMap`, `createEmptyTuple`, `toLowLevelDict`/`createMapFromLowLevelDict`, and
+`toTuple`/`fromTuple` are also modeled. Packing an aggregate into a low-level tuple intentionally
+widens field identity: unpacked fields may contain any callable slot from the packed value, while
+remaining complete when all slots were known.
+
+Source-defined higher-order helpers require no builtin model. For example, Acton's
+`array.each`, `array.map`, and `array.filter` flow through their ordinary receiver, callback
+parameter, callback return, loop, and collection operations. Generic instance calls preserve the
+receiver slot, and tuple/tensor destructuring distributes nested callable values to each binding.
+The stdlib's nested-tuple `lisp_list` representation also preserves callable heads across literal
+casts, prepend, lookup, tail, and pop operations.
 
 ```tolk
 fun invoke(index: int, value: int): int {
@@ -128,3 +143,6 @@ fun invoke(index: int, value: int): int {
 
 The analysis always computes the internal CFGs it needs. Setting `controlFlow: "none"`
 only omits public CFG objects and does not reduce call-site or call-graph precision.
+
+The audited operation matrix and the boundary for genuinely opaque runtime values are documented
+in [callable-flow audit](callable-flow-audit.md).

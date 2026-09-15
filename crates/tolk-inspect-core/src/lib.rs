@@ -46,6 +46,7 @@ const MAX_TRACKED_ARRAY_LENGTHS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectionKind {
     Array,
+    LispList,
     Map,
 }
 
@@ -71,6 +72,14 @@ impl CallableValue {
     fn non_callable() -> Self {
         Self {
             complete: true,
+            ..Self::default()
+        }
+    }
+
+    fn empty_aggregate() -> Self {
+        Self {
+            complete: true,
+            members_complete: true,
             ..Self::default()
         }
     }
@@ -115,6 +124,43 @@ impl CallableValue {
             result = merged_callable_value(&result, value);
         }
         result
+    }
+
+    fn any_nested_callable(&self) -> Self {
+        if self.bottom {
+            return Self::bottom();
+        }
+        let mut result = Self {
+            targets: self.targets.clone(),
+            complete: self.complete && (self.members_complete || !self.targets.is_empty()),
+            ..Self::default()
+        };
+        for value in self.members.values() {
+            result = merged_callable_value(&result, &value.any_nested_callable());
+        }
+        result
+    }
+
+    fn packed_tuple(&self) -> Self {
+        if self.bottom {
+            return Self::bottom();
+        }
+        let mut packed = Self::empty_aggregate();
+        packed.array_lengths = None;
+        packed.set_dynamic_member(self.any_nested_callable());
+        packed
+    }
+
+    fn unpacked_tuple(&self) -> Self {
+        if self.bottom {
+            return Self::bottom();
+        }
+        let flattened = self.any_nested_callable();
+        let mut unpacked = self.clone();
+        unpacked.targets = flattened.targets.clone();
+        unpacked.complete = flattened.complete;
+        unpacked.set_dynamic_member(flattened);
+        unpacked
     }
 
     fn set_dynamic_member(&mut self, value: Self) {
@@ -1686,6 +1732,13 @@ impl<'a> SnapshotBuilder<'a> {
             )
             && let Some(receiver) = call
                 .child_by_field_name("callee")
+                .and_then(|callee| {
+                    if callee.kind() == "generic_instantiation" {
+                        callee.child_by_field_name("expr")
+                    } else {
+                        Some(callee)
+                    }
+                })
                 .and_then(|callee| callee.child_by_field_name("obj"))
         {
             values.push(self.callable_value(
@@ -1780,14 +1833,22 @@ impl<'a> SnapshotBuilder<'a> {
         let syntax = file.as_ref().and_then(|file| file.find_node_at_span(span));
 
         let assignment = syntax.filter(|node| node.kind() == "assignment");
-        let assigned = assignment.and_then(|node| {
-            let left = node.child_by_field_name("left")?;
-            let right = node.child_by_field_name("right")?;
-            let path = self.local_assignment_target(file_id, left, flow_node, resolved_by_span)?;
+        let mut assigned = vec![];
+        if let Some(node) = assignment
+            && let Some(left) = node.child_by_field_name("left")
+            && let Some(right) = node.child_by_field_name("right")
+        {
             let value =
                 self.callable_value(file_id, right, incoming, resolved_by_span, return_values);
-            Some((path, value))
-        });
+            self.collect_callable_assignments(
+                file_id,
+                left,
+                &value,
+                flow_node,
+                resolved_by_span,
+                &mut assigned,
+            );
+        }
 
         // Any unmodelled write may replace a callable value, so invalidate it first.
         for local in &flow_node.writes {
@@ -1810,7 +1871,7 @@ impl<'a> SnapshotBuilder<'a> {
                 mutation_values,
             );
         }
-        if let Some((path, value)) = assigned {
+        for (path, value) in assigned {
             if path.members.is_empty() {
                 outgoing.insert(path.root, value);
             } else {
@@ -1820,6 +1881,79 @@ impl<'a> SnapshotBuilder<'a> {
             }
         }
         outgoing
+    }
+
+    fn collect_callable_assignments(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        value: &CallableValue,
+        flow_node: &tolk_dataflow::FlowNode,
+        resolved_by_span: &ResolutionsBySpan,
+        assigned: &mut Vec<(LocalPath, CallableValue)>,
+    ) {
+        match node.kind() {
+            "var_declaration_lhs" => {
+                let mut cursor = node.walk();
+                if let Some(pattern) = node.named_children(&mut cursor).next() {
+                    self.collect_callable_assignments(
+                        file_id,
+                        pattern,
+                        value,
+                        flow_node,
+                        resolved_by_span,
+                        assigned,
+                    );
+                }
+            }
+            "tuple_vars_declaration"
+            | "tensor_vars_declaration"
+            | "tensor_expression"
+            | "typed_tuple" => {
+                let mut cursor = node.walk();
+                for (index, element) in node.named_children(&mut cursor).enumerate() {
+                    let key = if value.array_lengths.is_some() {
+                        format!("int:{index}")
+                    } else {
+                        index.to_string()
+                    };
+                    self.collect_callable_assignments(
+                        file_id,
+                        element,
+                        &value.member(&key),
+                        flow_node,
+                        resolved_by_span,
+                        assigned,
+                    );
+                }
+            }
+            "var_declaration" => {
+                let Some(name) = node.child_by_field_name("name") else {
+                    return;
+                };
+                let Some(local) = self
+                    .project
+                    .get_resolved_uses(file_id)
+                    .and_then(|resolve| resolve.find_local_at(name.start_byte()))
+                else {
+                    return;
+                };
+                assigned.push((
+                    LocalPath {
+                        root: local.id,
+                        members: vec![],
+                    },
+                    value.clone(),
+                ));
+            }
+            _ => {
+                if let Some(path) =
+                    self.local_assignment_target(file_id, node, flow_node, resolved_by_span)
+                {
+                    assigned.push((path, value.clone()));
+                }
+            }
+        }
     }
 
     fn apply_collection_mutations(
@@ -1906,6 +2040,26 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 true
             }
+            (CollectionKind::LispList, "prependHead") => {
+                let Some(value) = arguments.first() else {
+                    return;
+                };
+                let value =
+                    self.callable_value(file_id, *value, state, resolved_by_span, return_values);
+                let tail = collection.clone();
+                let mut pair = CallableValue::empty_aggregate();
+                pair.members.insert("0".into(), value);
+                pair.members.insert("1".into(), tail);
+                collection.members.insert("tvmTuple".into(), pair);
+                true
+            }
+            (CollectionKind::LispList, "popHead") => {
+                let tail = collection.member("tvmTuple").member("1");
+                collection
+                    .members
+                    .insert("tvmTuple".into(), tail.member("tvmTuple"));
+                true
+            }
             (
                 CollectionKind::Map,
                 "set"
@@ -1932,6 +2086,15 @@ impl<'a> SnapshotBuilder<'a> {
                     }
                 } else {
                     collection.set_dynamic_member(value);
+                }
+                true
+            }
+            (CollectionKind::Map, "delete" | "deleteAndGetDeleted") => {
+                let Some(key) = arguments.first() else {
+                    return;
+                };
+                if let Some(key) = self.collection_key(file_id, *key, resolved_by_span) {
+                    collection.members.remove(&key);
                 }
                 true
             }
@@ -1978,6 +2141,22 @@ impl<'a> SnapshotBuilder<'a> {
         let Some(callee) = node.child_by_field_name("callee") else {
             return;
         };
+        let unwrapped_callee = if callee.kind() == "generic_instantiation" {
+            callee.child_by_field_name("expr")
+        } else {
+            Some(callee)
+        };
+        if let Some(callee) = unwrapped_callee
+            && callee.kind() == "dot_access"
+            && let Some(receiver) = callee.child_by_field_name("obj")
+            && self.collection_kind(file_id, receiver) == Some(CollectionKind::LispList)
+            && callee
+                .child_by_field_name("field")
+                .and_then(|field| self.node_text(file_id, field))
+                .is_some_and(|method| matches!(method.as_str(), "prependHead" | "popHead"))
+        {
+            return;
+        }
         let direct = self.direct_callable_target(file_id, callee, resolved_by_span);
         let called = direct.map_or_else(
             || self.callable_value(file_id, callee, state, resolved_by_span, return_values),
@@ -2124,6 +2303,57 @@ impl<'a> SnapshotBuilder<'a> {
         self.callable_value_depth(file_id, node, state, resolved_by_span, return_values, 0)
     }
 
+    fn lisp_list_value(
+        &self,
+        file_id: FileId,
+        node: Node<'_>,
+        state: &CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+        depth: usize,
+    ) -> CallableValue {
+        if node.kind() == "typed_tuple" {
+            let mut list = CallableValue::empty_aggregate();
+            list.members
+                .insert("tvmTuple".into(), CallableValue::non_callable());
+            let mut cursor = node.walk();
+            let elements = node.named_children(&mut cursor).collect::<Vec<_>>();
+            for element in elements.into_iter().rev() {
+                let mut pair = CallableValue::empty_aggregate();
+                pair.members.insert(
+                    "0".into(),
+                    self.callable_value_depth(
+                        file_id,
+                        element,
+                        state,
+                        resolved_by_span,
+                        return_values,
+                        depth + 1,
+                    ),
+                );
+                pair.members.insert("1".into(), list);
+                list = CallableValue::empty_aggregate();
+                list.members.insert("tvmTuple".into(), pair);
+            }
+            return list;
+        }
+
+        let inner = self.callable_value_depth(
+            file_id,
+            node,
+            state,
+            resolved_by_span,
+            return_values,
+            depth + 1,
+        );
+        if inner.bottom {
+            return inner;
+        }
+        let mut list = CallableValue::empty_aggregate();
+        list.members.insert("tvmTuple".into(), inner);
+        list
+    }
+
     fn collection_kind(&self, file_id: FileId, node: Node<'_>) -> Option<CollectionKind> {
         self.collection_kinds
             .get(&(file_id, node.start_byte() as u32, node.end_byte() as u32))
@@ -2204,6 +2434,79 @@ impl<'a> SnapshotBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn builtin_call_value(
+        &self,
+        file_id: FileId,
+        call: Node<'_>,
+        state: &CallableState,
+        resolved_by_span: &ResolutionsBySpan,
+        return_values: &ReturnValues,
+        depth: usize,
+    ) -> Option<CallableValue> {
+        let callee = call.child_by_field_name("callee")?;
+        let symbol = self.resolved_callable_symbol(file_id, callee, resolved_by_span)?;
+        let declaration_file = self.file_db.get_by_id(symbol.id.file_id)?;
+        let declaration = declaration_file.find_syntax_declaration(symbol.id)?;
+        let is_builtin = declaration
+            .syntax()
+            .child_by_field_name("builtin_specifier")
+            .is_some();
+        let arguments = Self::call_arguments(call);
+
+        match symbol.name.as_ref() {
+            "createEmptyMap" if is_builtin => Some(CallableValue::empty_aggregate()),
+            "createEmptyTuple" if is_builtin => {
+                let mut value = CallableValue::empty_aggregate();
+                value.array_lengths = Some(BTreeSet::from([0]));
+                Some(value)
+            }
+            "createMapFromLowLevelDict" if is_builtin => arguments.first().map(|argument| {
+                self.callable_value_depth(
+                    file_id,
+                    *argument,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    depth + 1,
+                )
+            }),
+            "toTuple" if is_builtin => call
+                .child_by_field_name("callee")
+                .and_then(|callee| {
+                    let callee = if callee.kind() == "generic_instantiation" {
+                        callee.child_by_field_name("expr")?
+                    } else {
+                        callee
+                    };
+                    callee.child_by_field_name("obj")
+                })
+                .map(|receiver| {
+                    self.callable_value_depth(
+                        file_id,
+                        receiver,
+                        state,
+                        resolved_by_span,
+                        return_values,
+                        depth + 1,
+                    )
+                    .packed_tuple()
+                }),
+            "fromTuple" if is_builtin => arguments.first().map(|argument| {
+                self.callable_value_depth(
+                    file_id,
+                    *argument,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    depth + 1,
+                )
+                .unpacked_tuple()
+            }),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn collection_call_value(
         &self,
         file_id: FileId,
@@ -2263,6 +2566,12 @@ impl<'a> SnapshotBuilder<'a> {
                 );
                 Some(value)
             }
+            (CollectionKind::LispList, "getHead" | "popHead") => {
+                Some(collection.member("tvmTuple").member("0"))
+            }
+            (CollectionKind::LispList, "getTail") => {
+                Some(collection.member("tvmTuple").member("1"))
+            }
             (CollectionKind::Map, "get") => Some(Self::map_lookup_result(self.collection_lookup(
                 file_id,
                 &collection,
@@ -2275,6 +2584,30 @@ impl<'a> SnapshotBuilder<'a> {
                 arguments.first().copied(),
                 resolved_by_span,
             )),
+            (CollectionKind::Map, "toLowLevelDict") => Some(collection),
+            (
+                CollectionKind::Map,
+                "setAndGetPrevious"
+                | "replaceAndGetPrevious"
+                | "addOrGetExisting"
+                | "deleteAndGetDeleted",
+            ) => Some(Self::map_lookup_result(self.collection_lookup(
+                file_id,
+                &collection,
+                arguments.first().copied(),
+                resolved_by_span,
+            ))),
+            (
+                CollectionKind::Map,
+                "findFirst"
+                | "findLast"
+                | "findKeyGreater"
+                | "findKeyGreaterOrEqual"
+                | "findKeyLess"
+                | "findKeyLessOrEqual"
+                | "iterateNext"
+                | "iteratePrev",
+            ) => Some(Self::map_lookup_result(collection.any_member())),
             (CollectionKind::Map, "set") => {
                 let mut updated = collection;
                 if let Some(value) = arguments.get(1) {
@@ -2330,6 +2663,16 @@ impl<'a> SnapshotBuilder<'a> {
                 .map(CallableValue::target)
                 .unwrap_or_default(),
             "function_call" => {
+                if let Some(value) = self.builtin_call_value(
+                    file_id,
+                    node,
+                    state,
+                    resolved_by_span,
+                    return_values,
+                    depth,
+                ) {
+                    return value;
+                }
                 if let Some(value) = self.collection_call_value(
                     file_id,
                     node,
@@ -2412,14 +2755,29 @@ impl<'a> SnapshotBuilder<'a> {
             "cast_as_operator" => node
                 .child_by_field_name("expr")
                 .map(|inner| {
-                    self.callable_value_depth(
+                    if self.collection_kind(file_id, node) == Some(CollectionKind::LispList) {
+                        return self.lisp_list_value(
+                            file_id,
+                            inner,
+                            state,
+                            resolved_by_span,
+                            return_values,
+                            depth,
+                        );
+                    }
+                    let value = self.callable_value_depth(
                         file_id,
                         inner,
                         state,
                         resolved_by_span,
                         return_values,
                         depth + 1,
-                    )
+                    );
+                    if self.collection_kind(file_id, inner) == Some(CollectionKind::LispList) {
+                        value.member("tvmTuple")
+                    } else {
+                        value
+                    }
                 })
                 .unwrap_or_default(),
             "ternary_operator" => {
@@ -2550,6 +2908,39 @@ impl<'a> SnapshotBuilder<'a> {
             ),
             _ => None,
         }
+    }
+
+    fn resolved_callable_symbol<'b>(
+        &'b self,
+        file_id: FileId,
+        node: Node<'_>,
+        resolved_by_span: &ResolutionsBySpan,
+    ) -> Option<&'b Symbol> {
+        let resolved = match node.kind() {
+            "identifier" => self.resolved_node(file_id, node, resolved_by_span),
+            "dot_access" => node
+                .child_by_field_name("field")
+                .and_then(|field| self.resolved_node(file_id, field, resolved_by_span)),
+            "generic_instantiation" | "cast_as_operator" => {
+                return self.resolved_callable_symbol(
+                    file_id,
+                    node.child_by_field_name("expr")?,
+                    resolved_by_span,
+                );
+            }
+            "parenthesized_expression" | "not_null_operator" => {
+                return self.resolved_callable_symbol(
+                    file_id,
+                    node.child_by_field_name("inner")?,
+                    resolved_by_span,
+                );
+            }
+            _ => None,
+        }?;
+        let Resolved::Global(symbol) = resolved else {
+            return None;
+        };
+        self.project.resolve_symbol(*symbol)
     }
 
     fn node_text(&self, file_id: FileId, node: Node<'_>) -> Option<String> {
@@ -3028,15 +3419,7 @@ fn collection_kinds(bodies: &WorkspaceBodyTypes, type_db: &TypeDb<'_>) -> Collec
     for (&file_id, file_bodies) in bodies {
         for inference in file_bodies.values() {
             for (&span, &ty) in &inference.expression_types {
-                let ty = type_db.intrn.unwrap_alias(ty);
-                let kind = match type_db.intrn.data(ty) {
-                    TyData::Array(_) => Some(CollectionKind::Array),
-                    TyData::MapKV { .. } => Some(CollectionKind::Map),
-                    TyData::Struct { name, .. } if name.as_ref() == "map" => {
-                        Some(CollectionKind::Map)
-                    }
-                    _ => None,
-                };
+                let kind = collection_kind_for_type(type_db.intrn, ty);
                 if let Some(kind) = kind {
                     kinds.insert((file_id, span.start, span.end), kind);
                 }
@@ -3044,6 +3427,27 @@ fn collection_kinds(bodies: &WorkspaceBodyTypes, type_db: &TypeDb<'_>) -> Collec
         }
     }
     kinds
+}
+
+fn collection_kind_for_type(interner: &TypeInterner, ty: TyId) -> Option<CollectionKind> {
+    let ty = interner.unwrap_alias(ty);
+    match interner.data(ty) {
+        TyData::Array(_) => Some(CollectionKind::Array),
+        TyData::MapKV { .. } => Some(CollectionKind::Map),
+        TyData::Struct { name, .. } if name.as_ref() == "map" => Some(CollectionKind::Map),
+        TyData::Struct { name, .. } if name.as_ref() == "lisp_list" => {
+            Some(CollectionKind::LispList)
+        }
+        TyData::GenericTypeWithTs { inner_ty, .. } => collection_kind_for_type(interner, *inner_ty),
+        TyData::Union(types) => {
+            let mut kinds = types
+                .iter()
+                .filter_map(|member| collection_kind_for_type(interner, *member));
+            let kind = kinds.next()?;
+            kinds.all(|candidate| candidate == kind).then_some(kind)
+        }
+        _ => None,
+    }
 }
 
 const fn control_flow_node_kind(kind: ActonFlowNodeKind) -> &'static str {
@@ -3410,19 +3814,55 @@ type int = builtin
 type bool = builtin
 type cell = builtin
 type unknown = builtin
+type void = builtin
+type dict = cell?
 struct map<K, V> { private tvmDict: cell? }
 struct array<T> { private tvmTuple: unknown }
+struct lisp_list<T> { private tvmTuple: [T, lisp_list<T>] | null }
 struct MapLookupResult<TValue> { private value: TValue, isFound: bool }
+struct MapEntry<K, V> { private key: K, private value: V, isFound: bool }
+fun createEmptyTuple(): array<unknown> builtin
+fun createEmptyMap<K, V>(): map<K, V> builtin
+fun createMapFromLowLevelDict<K, V>(d: dict): map<K, V> builtin
 fun array<T>.push(mutate self, value: T): void builtin
 fun array<T>.first(self): T builtin
 fun array<T>.get(self, index: int): T builtin
 fun array<T>.set(mutate self, value: T, index: int): void builtin
+fun array<T>.size(self): int builtin
 fun array<T>.last(self): T builtin
 fun array<T>.pop(mutate self): T builtin
+fun lisp_list<T>.prependHead(mutate self, value: T): void {
+    self.tvmTuple = [value, self.tvmTuple as unknown as lisp_list<T>];
+}
+fun lisp_list<T>.popHead(mutate self): T {
+    var [head, tail] = self.tvmTuple!;
+    self.tvmTuple = tail as unknown as [T, lisp_list<T>]?;
+    return head;
+}
+fun lisp_list<T>.getHead(self): T { return self.tvmTuple!.0; }
+fun T.toTuple(self): array<unknown> builtin
+fun T.fromTuple(packedObject: array<unknown>): T builtin
 fun map<K, V>.get(self, key: K): MapLookupResult<V> builtin
 fun map<K, V>.mustGet(self, key: K, throwIfNotFound: int = 9): V builtin
 fun map<K, V>.set(mutate self, key: K, value: V): self builtin
+fun map<K, V>.toLowLevelDict(self): dict asm "NOP"
+fun map<K, V>.setAndGetPrevious(mutate self, key: K, value: V): MapLookupResult<V> builtin
+fun map<K, V>.replaceIfExists(mutate self, key: K, value: V): bool builtin
+fun map<K, V>.replaceAndGetPrevious(mutate self, key: K, value: V): MapLookupResult<V> builtin
+fun map<K, V>.addIfNotExists(mutate self, key: K, value: V): bool builtin
+fun map<K, V>.addOrGetExisting(mutate self, key: K, value: V): MapLookupResult<V> builtin
+fun map<K, V>.delete(mutate self, key: K): bool builtin
+fun map<K, V>.deleteAndGetDeleted(mutate self, key: K): MapLookupResult<V> builtin
+fun map<K, V>.findFirst(self): MapEntry<K, V> builtin
+fun map<K, V>.findLast(self): MapEntry<K, V> builtin
+fun map<K, V>.findKeyGreater(self, pivotKey: K): MapEntry<K, V> builtin
+fun map<K, V>.findKeyGreaterOrEqual(self, pivotKey: K): MapEntry<K, V> builtin
+fun map<K, V>.findKeyLess(self, pivotKey: K): MapEntry<K, V> builtin
+fun map<K, V>.findKeyLessOrEqual(self, pivotKey: K): MapEntry<K, V> builtin
+fun map<K, V>.iterateNext(self, current: MapEntry<K, V>): MapEntry<K, V> builtin
+fun map<K, V>.iteratePrev(self, current: MapEntry<K, V>): MapEntry<K, V> builtin
 fun MapLookupResult<TValue>.loadValue(self): TValue { return self.value; }
+fun MapEntry<K, V>.loadValue(self): V { return self.value; }
 "#;
         inspect(ProjectInput {
             root: "/project".into(),
@@ -4447,6 +4887,378 @@ fun audit(value: int): int {
                 .iter()
                 .all(|call| call.targets == vec![global("reject").id.clone()])
         );
+    }
+
+    #[test]
+    fn resolves_callable_values_returned_by_the_complete_map_builtin_surface() {
+        let source = r#"
+fun previous(value: int): int { return value + 1; }
+fun replacement(value: int): int { return value + 2; }
+
+fun fromSet(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, previous);
+    return handlers.setAndGetPrevious(1, replacement).loadValue()(value);
+}
+
+fun fromReplace(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, previous);
+    return handlers.replaceAndGetPrevious(1, replacement).loadValue()(value);
+}
+
+fun fromAdd(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, previous);
+    return handlers.addOrGetExisting(1, replacement).loadValue()(value);
+}
+
+fun fromDelete(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, previous);
+    return handlers.deleteAndGetDeleted(1).loadValue()(value);
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+
+        for caller in ["fromSet", "fromReplace", "fromAdd", "fromDelete"] {
+            let call = snapshot
+                .call_sites
+                .iter()
+                .find(|call| {
+                    call.caller == global(caller).id
+                        && call.dispatch == "indirect"
+                        && !call.targets.is_empty()
+                })
+                .expect("returned map value invocation");
+            assert!(call.complete, "{caller} should be complete");
+            assert_eq!(call.targets, vec![global("previous").id.clone()]);
+        }
+    }
+
+    #[test]
+    fn conservatively_resolves_callable_values_from_ordered_map_iteration() {
+        let source = r#"
+fun first(value: int): int { return value + 1; }
+fun second(value: int): int { return value + 2; }
+
+fun audit(pivot: int, value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, first);
+    handlers.set(2, second);
+    val initial = handlers.findFirst();
+    val later = handlers.iterateNext(initial);
+    val selected = handlers.findKeyGreaterOrEqual(pivot);
+    return initial.loadValue()(later.loadValue()(selected.loadValue()(value)));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let expected = BTreeSet::from([global("first").id.clone(), global("second").id.clone()]);
+        let calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("audit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3);
+        for call in calls {
+            assert!(call.complete);
+            assert_eq!(
+                call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_empty_and_low_level_map_constructors() {
+        let source = r#"
+fun handler(value: int): int { return value + 1; }
+
+fun fromEmpty(value: int): int {
+    var handlers = createEmptyMap<int, (int) -> int>();
+    handlers.set(1, handler);
+    return handlers.mustGet(1)(value);
+}
+
+fun fromRoundTrip(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, handler);
+    val restored = createMapFromLowLevelDict<int, (int) -> int>(handlers.toLowLevelDict());
+    return restored.mustGet(1)(value);
+}
+
+fun fromEmptyTuple(value: int): int {
+    var handlers = createEmptyTuple() as array<(int) -> int>;
+    handlers.push(handler);
+    return handlers.get(0)(value);
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        for caller in ["fromEmpty", "fromRoundTrip", "fromEmptyTuple"] {
+            let call = snapshot
+                .call_sites
+                .iter()
+                .find(|call| {
+                    call.caller == global(caller).id
+                        && call.dispatch == "indirect"
+                        && !call.targets.is_empty()
+                })
+                .expect("map constructor callback invocation");
+            assert!(call.complete, "{caller} should be complete");
+            assert_eq!(call.targets, vec![global("handler").id.clone()]);
+        }
+    }
+
+    #[test]
+    fn tracks_the_complete_map_mutation_surface() {
+        let source = r#"
+fun removed(value: int): int { return value + 1; }
+fun replacement(value: int): int { return value + 2; }
+fun retained(value: int): int { return value + 3; }
+
+fun audit(value: int): int {
+    var handlers: map<int, (int) -> int> = [];
+    handlers.set(1, removed);
+    handlers.replaceIfExists(1, replacement);
+    handlers.addIfNotExists(2, retained);
+    handlers.delete(1);
+    return handlers.mustGet(2)(value);
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let call = snapshot
+            .call_sites
+            .iter()
+            .find(|call| {
+                call.caller == global("audit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .expect("map callback after conditional mutations");
+        assert!(call.complete);
+        assert_eq!(call.targets, vec![global("retained").id.clone()]);
+    }
+
+    #[test]
+    fn resolves_callable_values_in_stdlib_lisp_lists() {
+        let source = r#"
+fun first(value: int): int { return value + 1; }
+fun second(value: int): int { return value + 2; }
+
+fun literal(value: int): int {
+    val handlers = [first, second] as lisp_list<(int) -> int>;
+    return handlers.getHead()(value);
+}
+
+fun audit(value: int): int {
+    var handlers = [] as lisp_list<(int) -> int>;
+    handlers.prependHead(first);
+    handlers.prependHead(second);
+    val current = handlers.getHead();
+    val removed = handlers.popHead();
+    val remaining = handlers.getHead();
+    return current(removed(remaining(value)));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let literal = snapshot
+            .call_sites
+            .iter()
+            .find(|call| {
+                call.caller == global("literal").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .expect("literal lisp-list callback");
+        assert!(literal.complete, "{literal:#?}");
+        assert_eq!(literal.targets, vec![global("first").id.clone()]);
+
+        let mut calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("audit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|call| call.location.byte_range.start);
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| call.complete));
+        assert_eq!(calls[0].targets, vec![global("second").id.clone()]);
+        assert_eq!(calls[1].targets, vec![global("second").id.clone()]);
+        assert_eq!(calls[2].targets, vec![global("first").id.clone()]);
+    }
+
+    #[test]
+    fn resolves_source_defined_higher_order_array_helpers_and_destructuring() {
+        let source = r#"
+fun array<T>.map<U>(self, f: (T -> U)): array<U> {
+    var result: array<U> = [];
+    var index = 0;
+    repeat (self.size()) {
+        result.push(f(self.get(index)));
+        index += 1;
+    }
+    return result;
+}
+
+fun first(value: int): int { return value + 1; }
+fun second(value: int): int { return value + 2; }
+
+fun audit(index: int, value: int): int {
+    val handlers: array<(int) -> int> = [first, second];
+    val copied = handlers.map<(int) -> int>(fun (callback) { return callback; });
+    val (left, right) = (first, second);
+    return copied.get(index)(left(right(value)));
+}
+
+fun arrayDestructure(value: int): int {
+    val handlers: array<(int) -> int> = [first, second];
+    val [left, right] = handlers;
+    return left(right(value));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("audit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| call.complete));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.targets == vec![global("first").id.clone()])
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.targets == vec![global("second").id.clone()])
+        );
+        assert!(calls.iter().any(|call| {
+            call.targets.iter().cloned().collect::<BTreeSet<_>>()
+                == BTreeSet::from([global("first").id.clone(), global("second").id.clone()])
+        }));
+
+        let array_calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("arrayDestructure").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(array_calls.len(), 2);
+        assert!(array_calls.iter().all(|call| call.complete));
+        assert!(
+            array_calls
+                .iter()
+                .any(|call| call.targets == vec![global("first").id.clone()])
+        );
+        assert!(
+            array_calls
+                .iter()
+                .any(|call| call.targets == vec![global("second").id.clone()])
+        );
+    }
+
+    #[test]
+    fn keeps_callable_values_sound_through_low_level_tuple_packing() {
+        let source = r#"
+struct Handlers {
+    primary: ((int) -> int)
+    fallback: ((int) -> int)
+}
+
+fun first(value: int): int { return value + 1; }
+fun second(value: int): int { return value + 2; }
+
+fun audit(value: int): int {
+    val handlers = Handlers { primary: first, fallback: second };
+    val packed = handlers.toTuple();
+    val restored = Handlers.fromTuple(packed);
+    return restored.primary(restored.fallback(value));
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let expected = BTreeSet::from([global("first").id.clone(), global("second").id.clone()]);
+        let calls = snapshot
+            .call_sites
+            .iter()
+            .filter(|call| {
+                call.caller == global("audit").id
+                    && call.dispatch == "indirect"
+                    && !call.targets.is_empty()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert!(call.complete, "{call:#?}");
+            assert_eq!(
+                call.targets.iter().cloned().collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]
