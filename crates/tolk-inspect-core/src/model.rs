@@ -44,6 +44,7 @@ pub struct ProjectSnapshot {
     pub node_types: Vec<NodeType>,
     pub constant_values: Vec<SymbolConstantValue>,
     pub control_flow_graphs: Vec<ControlFlowGraph>,
+    pub call_sites: Vec<CallSite>,
     pub call_graph: Vec<CallEdge>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -229,6 +230,18 @@ pub struct CallEdge {
     pub callee: SymbolId,
     pub call_site: SourceLocation,
     pub node_id: Option<NodeId>,
+    pub dispatch: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSite {
+    pub caller: SymbolId,
+    pub location: SourceLocation,
+    pub node_id: Option<NodeId>,
+    pub dispatch: String,
+    pub targets: Vec<SymbolId>,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -128,6 +128,16 @@ export interface CallEdge {
   readonly callee: SymbolId;
   readonly callSite: SourceLocation;
   readonly nodeId?: NodeId;
+  readonly dispatch: "direct" | "indirect";
+}
+
+export interface CallSite {
+  readonly caller: SymbolId;
+  readonly location: SourceLocation;
+  readonly nodeId?: NodeId;
+  readonly dispatch: "direct" | "indirect";
+  readonly targets: readonly SymbolId[];
+  readonly complete: boolean;
 }
 
 export interface Diagnostic {
@@ -188,7 +198,8 @@ interface Snapshot {
   version: VersionInfo; root: string; files: RawSourceFile[]; nodes: RawAstNode[];
   symbols: SymbolInfo[]; references: Reference[]; resolutions: RawResolution[];
   types: TypeInfo[]; nodeTypes: RawNodeType[]; constantValues: RawSymbolConstantValue[];
-  controlFlowGraphs: RawControlFlowGraph[]; callGraph: CallEdge[]; diagnostics: Diagnostic[];
+  controlFlowGraphs: RawControlFlowGraph[]; callSites: CallSite[];
+  callGraph: CallEdge[]; diagnostics: Diagnostic[];
 }
 
 export class AstNode {
@@ -371,6 +382,7 @@ export class InspectedProject {
   #constantBySymbol = new Map<SymbolId, ConstantValue>();
   #controlFlowBySymbol = new Map<SymbolId, ControlFlowGraph>();
   #references: readonly Reference[];
+  #callSites: readonly CallSite[];
   #calls: readonly CallEdge[];
   #diagnostics: readonly Diagnostic[];
 
@@ -406,6 +418,7 @@ export class InspectedProject {
       this.#controlFlowBySymbol.set(graph.symbolId, graph);
     }
     this.#references = snapshot.references.map((item) => ({ ...item, symbolId: item.symbolId ?? undefined, nodeId: item.nodeId ?? undefined }));
+    this.#callSites = snapshot.callSites.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
     this.#calls = snapshot.callGraph.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
     this.#diagnostics = snapshot.diagnostics.map((item) => ({
       ...item,
@@ -480,6 +493,13 @@ export class InspectedProject {
     this.#active(); return [...this.#controlFlowBySymbol.values()];
   }
 
+  callSites(symbol?: SymbolId | SymbolInfo): readonly CallSite[] {
+    this.#active();
+    if (symbol === undefined) return this.#callSites;
+    const id = typeof symbol === "string" ? symbol : symbol.id;
+    return this.#callSites.filter((callSite) => callSite.caller === id);
+  }
+
   callGraph(): readonly CallEdge[] { this.#active(); return this.#calls }
   calls(symbol: SymbolId | SymbolInfo): readonly CallEdge[] {
     this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
@@ -497,7 +517,7 @@ export class InspectedProject {
     this.#symbolByNode.clear(); this.#resolutionByNode.clear(); this.#typeByNode.clear();
     this.#constantBySymbol.clear();
     this.#controlFlowBySymbol.clear();
-    this.#references = []; this.#calls = []; this.#diagnostics = [];
+    this.#references = []; this.#callSites = []; this.#calls = []; this.#diagnostics = [];
   }
 
   #active(): void { if (this.#disposed) throw new Error("This tolk-inspect project has been disposed") }

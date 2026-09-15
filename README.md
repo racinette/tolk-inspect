@@ -49,7 +49,7 @@ descendant filtering, generic named fields, and conveniences including `name`, `
 
 The project facade provides `file`, `node`, `symbols`, `symbol`, `symbolFor`, `symbolAt`,
 `resolve`, `references`, `typeOf`, `constantValue`, `controlFlow`, `controlFlowGraphs`,
-`callGraph`, `calls`, `callers`, and `diagnostics`.
+`callSites`, `callGraph`, `calls`, `callers`, and `diagnostics`.
 Diagnostics include Acton linter findings for workspace files, including rule codes,
 secondary annotations, help text, and structured automatic or manual fixes.
 
@@ -71,6 +71,25 @@ References include combinable `context.access.read`, `write`, and `mutate` facts
 by Acton's `tolk-analysis`, in addition to their syntactic usage and namespace.
 `constantValue` evaluates constant and enum-member symbols; integer values are decimal
 strings so values outside JavaScript's safe-integer range remain exact.
+
+Calls through local function values are resolved conservatively across assignments,
+local-to-local copies, branches, and loops. `callSites()` is the authoritative view of
+dispatch and resolution completeness; `callGraph()`, `calls()`, and `callers()` flatten
+every discovered target into an edge.
+
+```ts
+for (const callSite of project.callSites()) {
+  console.log(callSite.dispatch, callSite.targets);
+  if (!callSite.complete) {
+    console.warn("this call may also reach an unknown target", callSite.location);
+  }
+}
+```
+
+An indirect call can be complete with one or several targets, partially resolved with
+known targets plus `complete: false`, or wholly unknown with no targets and
+`complete: false`. Indirect analysis runs even when `controlFlow: "none"`; that option
+controls the public CFG payload, not call-graph precision.
 `versionInfo()` reports the package, pinned Acton revision, and analyzer Tolk version.
 
 ## Build and test
@@ -103,3 +122,5 @@ compatibility corpus under `fixtures/upstream/acton-v1.1.0` uses Acton v1.1.0 an
 matching Tolk 1.4.1 stdlib. See [design and compatibility notes](docs/design.md) for gaps.
 See [control-flow analysis](docs/control-flow.md) for the CFG API, common graph helpers,
 and an authorization-before-mutation audit example.
+See [call-site and call-graph analysis](docs/call-graph.md) for indirect-target and
+completeness semantics.

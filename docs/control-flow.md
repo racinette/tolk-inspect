@@ -158,5 +158,6 @@ returns `false` when the origin itself has no path to the exit.
 
 The first public CFG surface contains structural control flow, locations, AST links, and
 local read/write sets. Acton's internal audit-specific taint facts are not yet a public
-contract. CFGs also do not resolve calls through function-valued locals; that requires
-separate alias or points-to analysis.
+contract. `tolk-inspect` uses CFGs internally for conservative call-target analysis, but
+the resulting targets are exposed through `project.callSites()` and the call graph rather
+than as CFG-node facts.

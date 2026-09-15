@@ -208,3 +208,52 @@ fun conditionallyGuarded(mutate balance: int, isOwner: bool, amount: int) {
   });
   assert.equal(withoutCfg.controlFlowGraphs().length, 0);
 });
+
+test("resolves indirect calls through local callable values", async () => {
+  const project = await inspectProject({
+    root: "/virtual",
+    files: {
+      "/virtual/main.tolk": `
+fun first(value: int): int { return value; }
+fun second(value: int): int { return value + 1; }
+
+fun choose(flag: bool, value: int): int {
+  var action = first;
+  if (flag) {
+    action = second;
+  }
+  val alias = action;
+  return alias(value);
+}
+
+fun invoke(callback: (int) -> int, value: int): int {
+  return callback(value);
+}`,
+    },
+    controlFlow: "none",
+  });
+
+  assert.equal(project.controlFlowGraphs().length, 0);
+  const choose = project.symbols().find((symbol) => symbol.name === "choose");
+  const first = project.symbols().find((symbol) => symbol.name === "first");
+  const second = project.symbols().find((symbol) => symbol.name === "second");
+  const invoke = project.symbols().find((symbol) => symbol.name === "invoke");
+  assert.ok(choose && first && second && invoke);
+
+  const resolved = project.callSites(choose).find((callSite) => callSite.dispatch === "indirect");
+  assert.ok(resolved);
+  assert.equal(resolved.complete, true);
+  assert.deepEqual(new Set(resolved.targets), new Set([first.id, second.id]));
+  assert.deepEqual(
+    new Set(project.calls(choose).map((edge) => `${edge.dispatch}:${edge.callee}`)),
+    new Set([`indirect:${first.id}`, `indirect:${second.id}`]),
+  );
+
+  const unknown = project.callSites(invoke)[0];
+  assert.ok(unknown);
+  assert.equal(unknown.dispatch, "indirect");
+  assert.equal(unknown.complete, false);
+  assert.deepEqual(unknown.targets, []);
+  assert.equal(project.calls(invoke).length, 0);
+  assert.ok(project.callSites().length >= 2);
+});

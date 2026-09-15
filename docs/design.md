@@ -45,8 +45,10 @@ suppressions are honored. Dependency sources remain inspectable but are not lint
 
 - Official C++ compiler diagnostics require a separate compiler backend and are not
   available in the current WASM build.
-- Call sites cover statically resolved direct functions and methods. Calls through
-  function-valued locals have no global callee and therefore produce no call edge.
+- Calls through function-valued locals are resolved across direct assignments, copies,
+  branches, and loops. Values originating from callback parameters, function returns,
+  lambdas, or containers may remain partially or wholly unresolved; `callSites()` marks
+  those results with `complete: false` rather than inventing a target.
 - The API is snapshot-based; incremental updates require constructing another snapshot.
 
 ## Toolchain note
