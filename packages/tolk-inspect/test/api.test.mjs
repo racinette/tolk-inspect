@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { inspectProject, versionInfo } from "../dist/index.js";
+
+const packageMetadata = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 const input = {
   root: "/virtual",
@@ -37,7 +40,7 @@ test("exposes an owned semantic project facade", async () => {
 
 test("reports the exact analyzer revision", () => {
   assert.deepEqual(versionInfo(), {
-    packageVersion: "0.1.0",
+    packageVersion: packageMetadata.version,
     actonRevision: "17654feb713c5824ee4cc0259b7be9b5f72898ba",
     tolkVersion: "1.4.2",
   });

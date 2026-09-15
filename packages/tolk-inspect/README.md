@@ -1,37 +1,104 @@
 # tolk-inspect
 
 Read-only AST and semantic inspection for in-memory Tolk projects, backed by Rust and
-WebAssembly. See the repository README for the complete API, examples, compatibility
-policy, and build instructions.
+WebAssembly.
+
+`tolk-inspect` is designed for audit tools, linters, code navigation, and visualizations.
+It resolves project-wide symbols and types, evaluates constants, exposes control-flow
+graphs, traces direct and indirect calls, and reports Acton linter diagnostics.
+
+## Install
+
+```bash
+npm install tolk-inspect
+```
+
+The package is ESM-only, runs on Node.js 22 or newer, and has no runtime dependencies.
+Browser bundling is not currently supported.
+
+## Quickstart
 
 ```ts
 import { inspectProject } from "tolk-inspect";
 
 const project = await inspectProject({
   root: "/project",
-  files: { "/project/main.tolk": "fun main() {}" },
+  files: {
+    "/project/main.tolk": `
+      import "math";
+      fun main(): int { return answer(); }
+    `,
+    "/project/math.tolk": `
+      const VALUE = 42;
+      fun answer(): int { return VALUE; }
+    `,
+  },
+  entrypoints: ["/project/main.tolk"],
 });
 
-for (const file of project.files()) {
-  console.log([...file.ast.descendants("functionDeclaration")]);
+const answer = project.symbols().find((symbol) => symbol.name === "answer");
+if (answer) {
+  console.log("references", project.references(answer));
+  console.log("callers", project.callers(answer));
+  console.log("CFG", project.controlFlow(answer));
 }
+
+console.log("diagnostics", project.diagnostics());
+project.dispose();
 ```
 
-Resolved references include `context.access` flags for precise read, write, and mutation
-classification backed by Acton's `tolk-analysis` crate.
-`project.constantValue(symbol)` evaluates constants and enum members, representing integer
-values as exact decimal strings.
-`project.controlFlow(symbol)` returns a navigable per-callable CFG with reachability,
-dominance, source-location, AST-link, and local read/write information.
-`project.callSites()` exposes direct and indirect calls, possible global targets, and
-whether target resolution is complete. Whole-program callable flow crosses copies,
-branches, loops, callback parameters, function returns, recursion, lambdas, and nested
-tuple/object fields. Standard array/map storage, lookup, and mutation are also tracked,
-including previous/deleted values, ordered map traversal, constant and dynamic keys, low-level
-tuple/map round trips, tuple destructuring, and stdlib `lisp_list` operations. Lambda symbols own
-their internal call sites and CFGs, with callback captures modeled at creation time.
-`project.diagnostics()` includes Acton linter findings for workspace files with rule
-codes, annotations, help text, and structured fixes. Acton
-`check-disable-next-line` comments are honored.
+All paths are logical, normalized project paths. The analyzer never reads the filesystem;
+the caller supplies every workspace, Tolk standard-library, and Acton-library source.
+For a complete project, pass those sources together with their roots:
 
-Version 0.1.0 is tested on Node.js 20 and newer.
+```ts
+const project = await inspectProject({
+  root: "/project",
+  files: {
+    ...workspaceSources,
+    ...tolkStandardLibrarySources,
+    ...actonLibrarySources,
+  },
+  entrypoints: ["/project/contracts/main.tolk"],
+  stdlibRoot: "/project/.acton/tolk-stdlib",
+  actonStdlibRoot: "/project/.acton",
+  importMappings: { "@acton": "/project/.acton" },
+});
+```
+
+## Main API
+
+An `InspectedProject` provides:
+
+- `files()`, `node()`, and AST traversal through `AstNode`
+- `symbols()`, `symbolFor()`, `symbolAt()`, `resolve()`, and `references()`
+- `typeOf()` and exact `constantValue()` results
+- `controlFlow()`, including successors, predecessors, reachability, and dominance
+- `callSites()`, `callGraph()`, `calls()`, and `callers()`
+- `diagnostics()`, including structured Acton linter fixes
+
+`callSites()` is the authoritative representation for indirect calls. A call may have
+several conservative targets; `complete: false` means an additional source-level target
+could not be identified.
+
+Call `dispose()` when the snapshot is no longer needed. Access after disposal throws.
+
+## Analysis boundaries
+
+- Snapshots are immutable; analyze again after changing source text.
+- Official C++ compiler diagnostics are not part of the WASM package.
+- Callables originating in opaque FFI, runtime, or deserialized data may remain incomplete.
+- Callable analysis is intentionally whole-program and context-insensitive, so a helper
+  called with different callbacks reports their conservative union.
+
+## Guides and compatibility
+
+- [Full project README](https://github.com/racinette/tolk-inspect#readme)
+- [Control-flow analysis](https://github.com/racinette/tolk-inspect/blob/main/docs/control-flow.md)
+- [Call-site and call-graph analysis](https://github.com/racinette/tolk-inspect/blob/main/docs/call-graph.md)
+- [Callable-flow coverage](https://github.com/racinette/tolk-inspect/blob/main/docs/callable-flow-audit.md)
+- [Design and known boundaries](https://github.com/racinette/tolk-inspect/blob/main/docs/design.md)
+
+The analysis backend is pinned to Acton commit
+`17654feb713c5824ee4cc0259b7be9b5f72898ba`. Use `versionInfo()` to inspect the package,
+Acton revision, and analyzer Tolk version at runtime.

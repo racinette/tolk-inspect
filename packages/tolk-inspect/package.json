@@ -4,17 +4,35 @@
   "description": "Read-only semantic inspection for in-memory Tolk projects",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=20" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/racinette/tolk-inspect.git",
+    "directory": "packages/tolk-inspect"
+  },
+  "homepage": "https://github.com/racinette/tolk-inspect#readme",
+  "bugs": { "url": "https://github.com/racinette/tolk-inspect/issues" },
+  "keywords": ["tolk", "ton", "static-analysis", "ast", "control-flow", "wasm"],
+  "engines": { "node": ">=22" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
-  "files": ["dist", "generated", "README.md", "LICENSE"],
+  "files": ["dist", "generated", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:wasm": "bash ../../scripts/build-wasm.sh",
+    "check:versions": "node ../../scripts/check-versions.mjs",
     "test": "node --test test/*.test.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run check:versions && npm run build:wasm && npm run build"
   }
 }

@@ -5,7 +5,7 @@ logical paths and source text, performs parsing, project-aware resolution and ty
 inference in Rust/WebAssembly, and exposes an ergonomic TypeScript snapshot for lint,
 audit, and visualization scripts.
 
-The 0.1.0 package is tested on Node.js 20+. Its analysis core has no filesystem access:
+The 0.1.0 package is tested on Node.js 22+. Its analysis core has no filesystem access:
 callers provide every project, standard-library, and Acton-library source explicitly.
 
 ## Usage
@@ -105,7 +105,7 @@ tuple/map round trips, tuple destructuring, and stdlib `lisp_list` operations. S
 
 ## Build and test
 
-Prerequisites are Rust 1.97.1 with `wasm32-unknown-unknown`, Node.js 20+, npm,
+Prerequisites are Rust 1.97.1 with `wasm32-unknown-unknown`, Node.js 22+, npm,
 `wasm-bindgen-cli` matching the Cargo lockfile, and a WASI SDK installation.
 
 ```bash
@@ -135,3 +135,11 @@ See [control-flow analysis](docs/control-flow.md) for the CFG API, common graph 
 and an authorization-before-mutation audit example.
 See [call-site and call-graph analysis](docs/call-graph.md) for indirect-target and
 completeness semantics.
+
+## Release and security
+
+Every package tarball is rebuilt from Rust/WASM and TypeScript during `prepack`. Run
+`npm run release:check` for version synchronization, formatting, Clippy, the complete test
+suite, and a tarball dry run. See [the release guide](RELEASING.md) for npm trusted
+publishing and provenance setup, [the changelog](CHANGELOG.md) for release notes, and
+[the security policy](SECURITY.md) for private vulnerability reporting.

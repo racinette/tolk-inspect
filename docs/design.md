@@ -16,7 +16,7 @@ explicit UTF-8 byte ranges.
 - Reported Tolk version: 1.4.2
 - Compatibility corpus: Acton v1.1.0 / Tolk 1.4.1 sources and matching stdlib at commit
   `9cf4d1f410267178e943daf32b44353d99ddb6db`
-- Runtime tested in the first milestone: Node.js 20 and newer
+- Runtime supported in the first milestone: Node.js 22 and newer
 
 The core and WASM transport are filesystem-independent. Browser packaging is not claimed
 or tested in 0.1.0; the Node package uses wasm-bindgen's Node target.

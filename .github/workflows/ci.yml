@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  WASI_SDK_VERSION: "34"
+  WASI_SDK_VERSION_FULL: "34.0"
+  WASI_SDK_SHA256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install the pinned npm CLI
+        run: npm install --global npm@11.6.2
+
+      - name: Install Rust components
+        run: |
+          rustup component add clippy rustfmt
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+
+      - name: Install WASI SDK
+        run: |
+          archive="$RUNNER_TEMP/wasi-sdk.tar.gz"
+          url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION_FULL}-x86_64-linux.tar.gz"
+          curl --fail --silent --show-error --location "$url" --output "$archive"
+          echo "${WASI_SDK_SHA256}  ${archive}" | sha256sum --check
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-${WASI_SDK_VERSION_FULL}-x86_64-linux" >> "$GITHUB_ENV"
+
+      - run: npm ci
+      - run: npm run check:versions
+      - run: npm run check:format
+      - run: npm run check:clippy
+      - run: npm test
+      - run: npm run pack:dry-run
