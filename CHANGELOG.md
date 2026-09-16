@@ -3,6 +3,13 @@
 Notable changes to `tolk-inspect` are documented here. The project follows Semantic
 Versioning; while the package is below 1.0, minor releases may change the public API.
 
+## 0.1.1 - 2026-09-16
+
+### Fixed
+
+- Name Andrei Karavatski as the copyright holder in the MIT license and add a
+  repository-root license matching the npm package's copy.
+
 ## 0.1.0 - 2026-09-15
 
 ### Added
