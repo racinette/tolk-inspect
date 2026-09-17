@@ -12,11 +12,18 @@ explicit UTF-8 byte ranges.
 
 ## Compatibility target
 
-- Analyzer internals: Acton commit `17654feb713c5824ee4cc0259b7be9b5f72898ba`
+- Analyzer internals: stable Acton v1.2.0, locked to commit
+  `16d49e1f6ad68d67072b95c77ad9175c34ad7e17`
 - Reported Tolk version: 1.4.2
 - Compatibility corpus: Acton v1.1.0 / Tolk 1.4.1 sources and matching stdlib at commit
   `9cf4d1f410267178e943daf32b44353d99ddb6db`
 - Runtime supported in the first milestone: Node.js 22 and newer
+
+The v1.1.0 corpus remains a backward-compatibility check, not a v1.2.0 compiler fixture.
+Focused v1.2.0 regressions cover direct match-arm statements (including CFG and callable
+flow), enum semicolon separators, empty tuple types, leading-pipe parenthesized types,
+escaped triple-string delimiters, and the new `S009` linter rule. See
+[compatibility evidence](compatibility-evidence.md) for the scope of these checks.
 
 The core and WASM transport are filesystem-independent. Browser packaging is not claimed
 or tested in 0.1.0; the Node package uses wasm-bindgen's Node target.

@@ -1,4 +1,24 @@
-# Acton 1.1 compatibility evidence
+# Acton compatibility evidence
+
+## Stable Acton 1.2 analyzer backend
+
+The current backend uses the `v1.2.0` tag, resolved in `Cargo.lock` to
+`16d49e1f6ad68d67072b95c77ad9175c34ad7e17`. Runtime `versionInfo()` reports that exact
+revision and analyzer Tolk version 1.4.2.
+
+The focused corpus under `fixtures/projects/acton-v1.2-regressions` is exercised by native
+Rust tests and public Node/WASM tests. It checks direct match-arm statements through
+resolution, local accesses, CFG edges/navigation, and direct/indirect call targets. It
+also checks enum semicolon separators, empty/nested tuple types, leading-pipe
+parenthesized types, and escaped triple-string delimiters. Separate tests check `S009`
+diagnostics and automatic fixes with modern stdlibs, local shadowing, old stdlibs, and
+user-defined functions.
+
+These checks validate the analyzer and package, not execution by the official v1.2.0 C++
+compiler. The older upstream corpus and compiler evidence below remain deliberately
+versioned as v1.1.0 backward compatibility.
+
+## Acton 1.1 compiler and corpus evidence
 
 The corpus under `fixtures/upstream/acton-v1.1.0` is copied from the exact v1.1.0 commit,
 `9cf4d1f410267178e943daf32b44353d99ddb6db`, together with that release's Tolk 1.4.1

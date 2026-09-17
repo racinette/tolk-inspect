@@ -2,8 +2,12 @@
 
 This audit checks the callable-carrying surfaces present in the pinned Tolk 1.4.2 / Acton analyzer
 stack. It covers the core stdlib, Acton's source library, and its lambda-focused integration tests
-at commit
-`17654feb713c5824ee4cc0259b7be9b5f72898ba`.
+originally at commit `17654feb713c5824ee4cc0259b7be9b5f72898ba`.
+
+The audit's regression suite is retained against stable Acton v1.2.0, commit
+`16d49e1f6ad68d67072b95c77ad9175c34ad7e17`. The upgrade also adds a regression for callback
+assignments and invocations inside direct match-arm control-flow statements. This
+revalidation does not replace the original source-surface audit with a new exhaustive audit.
 
 ## Audited surfaces
 

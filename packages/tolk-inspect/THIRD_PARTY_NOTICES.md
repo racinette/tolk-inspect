@@ -11,7 +11,8 @@ The analyzer incorporates `tolk-analysis`, `tolk-dataflow`, `tolk-linter`, `tolk
 
 <https://github.com/ton-blockchain/acton>
 
-Revision: `17654feb713c5824ee4cc0259b7be9b5f72898ba`
+Release: `v1.2.0`
+Revision: `16d49e1f6ad68d67072b95c77ad9175c34ad7e17`
 
 Copyright (c) 2025 TON Core
 

@@ -26,7 +26,7 @@ use tolk_resolver::{
 use tolk_ty::{FileBodyTypes, TyData, TyId, TypeDb, TypeInterner, WorkspaceBodyTypes, infer};
 use tree_sitter::Node;
 
-pub const ACTON_REVISION: &str = "17654feb713c5824ee4cc0259b7be9b5f72898ba";
+pub const ACTON_REVISION: &str = "16d49e1f6ad68d67072b95c77ad9175c34ad7e17";
 pub const TOLK_VERSION: &str = "1.4.2";
 
 type ResolutionsBySpan = HashMap<(FileId, u32, u32), Resolved>;
@@ -3864,6 +3864,10 @@ fun map<K, V>.iteratePrev(self, current: MapEntry<K, V>): MapEntry<K, V> builtin
 fun MapLookupResult<TValue>.loadValue(self): TValue { return self.value; }
 fun MapEntry<K, V>.loadValue(self): V { return self.value; }
 "#;
+        project_with_common_stdlib(source, common)
+    }
+
+    fn project_with_common_stdlib(source: &str, common: &str) -> ProjectSnapshot {
         inspect(ProjectInput {
             root: "/project".into(),
             files: [
@@ -4116,6 +4120,169 @@ fun flow(x: int): int {
         assert!(graph.nodes.iter().any(|node| {
             node.kind == "condition" && node.location.is_some() && node.ast_node_id.is_some()
         }));
+    }
+
+    #[test]
+    fn preserves_direct_match_arm_control_flow_references_and_callable_targets() {
+        let source =
+            include_str!("../../../fixtures/projects/acton-v1.2-regressions/match-statements.tolk");
+        let snapshot =
+            project_with_common_stdlib(source, "type int = builtin\ntype bool = builtin\n");
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.phase != "parse" && diagnostic.phase != "resolution"),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let flow = global("flow");
+        let graph = snapshot
+            .control_flow_graphs
+            .iter()
+            .find(|graph| graph.symbol_id == flow.id)
+            .expect("match-arm CFG");
+        for kind in ["loopBack", "trueBranch", "falseBranch", "return", "throw"] {
+            assert!(graph.edges.iter().any(|edge| edge.kind == kind), "{kind}");
+        }
+        let x = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == "x" && symbol.containing_symbol.as_ref() == Some(&flow.id)
+            })
+            .expect("mutable parameter");
+        assert!(graph.nodes.iter().any(|node| node.reads.contains(&x.id)));
+        assert!(graph.nodes.iter().any(|node| node.writes.contains(&x.id)));
+        assert!(graph.nodes.iter().any(|node| {
+            node.kind == "condition" && node.location.is_some() && node.ast_node_id.is_some()
+        }));
+
+        let targets = BTreeSet::from([global("first").id.clone(), global("second").id.clone()]);
+        let matched = global("matched");
+        let indirect = snapshot
+            .call_sites
+            .iter()
+            .find(|site| site.caller == matched.id && site.dispatch == "indirect")
+            .expect("callback call after match");
+        assert!(indirect.complete);
+        assert_eq!(
+            indirect.targets.iter().cloned().collect::<BTreeSet<_>>(),
+            targets
+        );
+        let inside_arm = global("insideArm");
+        assert_eq!(
+            snapshot
+                .call_sites
+                .iter()
+                .filter(|site| site.caller == inside_arm.id)
+                .flat_map(|site| {
+                    assert!(site.complete);
+                    assert_eq!(site.dispatch, "direct");
+                    site.targets.iter().cloned()
+                })
+                .collect::<BTreeSet<_>>(),
+            targets
+        );
+    }
+
+    #[test]
+    fn parses_acton_1_2_enum_tuple_union_and_triple_string_fixes() {
+        let source =
+            include_str!("../../../fixtures/projects/acton-v1.2-regressions/parser-fixes.tolk");
+        let snapshot = project(&[("/project/main.tolk", source)], &["/project/main.tolk"]);
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.phase != "parse")
+        );
+        for name in [
+            "Mode",
+            "First",
+            "Second",
+            "Third",
+            "Fourth",
+            "Empty",
+            "Nested",
+            "Choice",
+            "ESCAPED_END",
+            "ESCAPED_MIDDLE",
+            "ESCAPED_ONE_QUOTE",
+            "ESCAPED_TWO_QUOTES",
+        ] {
+            assert!(
+                snapshot.symbols.iter().any(|symbol| symbol.name == name),
+                "{name}"
+            );
+        }
+        let fourth = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Fourth")
+            .unwrap();
+        assert!(snapshot.constant_values.iter().any(|constant| {
+            constant.symbol_id == fourth.id
+                && matches!(&constant.value, ConstantValue::Int { value, .. } if value == "4")
+        }));
+    }
+
+    #[test]
+    fn exposes_acton_1_2_prefer_grams_with_safe_fix_boundaries() {
+        let old_stdlib =
+            "type int = builtin\ntype slice = builtin\nfun ton(value: slice): int builtin\n";
+        let new_stdlib = format!("{old_stdlib}fun grams(value: slice): int builtin\n");
+        for (source, common, expected, fixable) in [
+            (
+                "fun main(): int { return ton(\"1\"); }",
+                new_stdlib.as_str(),
+                true,
+                true,
+            ),
+            (
+                "fun main(): int { val grams = 1; return ton(\"1\"); }",
+                new_stdlib.as_str(),
+                true,
+                false,
+            ),
+            (
+                "fun main(): int { return ton(\"1\"); }",
+                old_stdlib,
+                false,
+                false,
+            ),
+            (
+                "fun ton(value: slice): int { return 1; }\nfun main(): int { return ton(\"1\"); }",
+                "type int = builtin\ntype slice = builtin\nfun grams(value: slice): int builtin\n",
+                false,
+                false,
+            ),
+        ] {
+            let snapshot = project_with_common_stdlib(source, common);
+            let diagnostic = snapshot
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code.as_deref() == Some("S009"));
+            assert_eq!(diagnostic.is_some(), expected, "{source}");
+            if let Some(diagnostic) = diagnostic {
+                assert_eq!(diagnostic.phase, "lint");
+                assert_eq!(diagnostic.severity, "warning");
+                assert_eq!(!diagnostic.fixes.is_empty(), fixable, "{source}");
+                if fixable {
+                    assert!(diagnostic.fixes.iter().any(|fix| {
+                        fix.applicability == "automatic"
+                            && fix.edits.iter().any(|edit| edit.replacement == "grams")
+                    }));
+                }
+            }
+        }
     }
 
     #[test]

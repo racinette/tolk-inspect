@@ -58,7 +58,7 @@ writeFileSync(join(consumer, "consumer.mjs"), `
   assert.ok(helperCfg);
   assert.equal(helperCfg.isReachable(helperCfg.exit), true);
   assert.equal(helperCfg.dominates(helperCfg.entry, helperCfg.exit), true);
-  assert.equal(versionInfo().actonRevision, "17654feb713c5824ee4cc0259b7be9b5f72898ba");
+  assert.equal(versionInfo().actonRevision, "16d49e1f6ad68d67072b95c77ad9175c34ad7e17");
   assert.equal(versionInfo().packageVersion, ${JSON.stringify(packageMetadata.version)});
   console.log("installed-package e2e passed");
 `);
