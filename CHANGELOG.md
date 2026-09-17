@@ -3,7 +3,7 @@
 Notable changes to `tolk-inspect` are documented here. The project follows Semantic
 Versioning; while the package is below 1.0, minor releases may change the public API.
 
-## Unreleased
+## 0.1.2 - 2026-09-17
 
 ### Changed
 
