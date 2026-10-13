@@ -127,8 +127,8 @@ To repeat the release-compiler compatibility check with an installed or download
 ACTON_V1_1_BIN=/path/to/acton npm run test:compat
 ```
 
-Dependencies use the stable Acton `v1.2.0` Git tag; the committed `Cargo.lock` pins it to
-`16d49e1f6ad68d67072b95c77ad9175c34ad7e17`. Focused parser, CFG, and callable-flow
+Dependencies use the stable Acton `v1.2.1` Git tag; the committed `Cargo.lock` pins it to
+`13594911b09b0a9bc68910111e0bb88a74161f5b`. Focused parser, CFG, and callable-flow
 regressions cover the upgraded backend. The self-contained compatibility corpus under
 `fixtures/upstream/acton-v1.1.0` uses Acton v1.1.0 and its
 matching Tolk 1.4.1 stdlib. See [design and compatibility notes](docs/design.md) for gaps.

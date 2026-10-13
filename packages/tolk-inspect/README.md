@@ -99,6 +99,6 @@ Call `dispose()` when the snapshot is no longer needed. Access after disposal th
 - [Callable-flow coverage](https://github.com/racinette/tolk-inspect/blob/main/docs/callable-flow-audit.md)
 - [Design and known boundaries](https://github.com/racinette/tolk-inspect/blob/main/docs/design.md)
 
-The analysis backend uses stable Acton `v1.2.0`, locked to commit
-`16d49e1f6ad68d67072b95c77ad9175c34ad7e17`. Use `versionInfo()` to inspect the package,
+The analysis backend uses stable Acton `v1.2.1`, locked to commit
+`13594911b09b0a9bc68910111e0bb88a74161f5b`. Use `versionInfo()` to inspect the package,
 Acton revision, and analyzer Tolk version at runtime.

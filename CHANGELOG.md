@@ -3,6 +3,21 @@
 Notable changes to `tolk-inspect` are documented here. The project follows Semantic
 Versioning; while the package is below 1.0, minor releases may change the public API.
 
+## 0.1.3 - 2026-10-13
+
+### Changed
+
+- Use stable Acton v1.2.1 (Tolk 1.5.0) with the exact release revision retained in
+  `Cargo.lock` and runtime metadata. The Rust toolchain pin moves to 1.98.1 as the new
+  crates require.
+- Drop the `bytes` type kind: Tolk 1.5 resolves declared `bytesN` aliases as user-defined
+  types and uses `bitsN` for fixed-size bit strings.
+
+### Added
+
+- Upgrade regressions for loop `break`/`continue` control flow, nullable smart casts, and
+  declared `bytesN` aliases of `bitsN`.
+
 ## 0.1.2 - 2026-09-17
 
 ### Changed

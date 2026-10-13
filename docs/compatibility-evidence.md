@@ -2,9 +2,9 @@
 
 ## Stable Acton 1.2 analyzer backend
 
-The current backend uses the `v1.2.0` tag, resolved in `Cargo.lock` to
-`16d49e1f6ad68d67072b95c77ad9175c34ad7e17`. Runtime `versionInfo()` reports that exact
-revision and analyzer Tolk version 1.4.2.
+The current backend uses the `v1.2.1` tag, resolved in `Cargo.lock` to
+`13594911b09b0a9bc68910111e0bb88a74161f5b`. Runtime `versionInfo()` reports that exact
+revision and analyzer Tolk version 1.5.0.
 
 The focused corpus under `fixtures/projects/acton-v1.2-regressions` is exercised by native
 Rust tests and public Node/WASM tests. It checks direct match-arm statements through
@@ -14,7 +14,13 @@ parenthesized types, and escaped triple-string delimiters. Separate tests check 
 diagnostics and automatic fixes with modern stdlibs, local shadowing, old stdlibs, and
 user-defined functions.
 
-These checks validate the analyzer and package, not execution by the official v1.2.0 C++
+The corpus under `fixtures/projects/acton-v1.2.1-regressions` covers the Tolk 1.5 behavior
+in v1.2.1: `break` and `continue` through nested `repeat`, `while`, and `match` bodies in
+CFGs with unreachable statements after an unconditional exit, nullable smart casts inside
+null checks, and declared `bytesN` aliases of `bitsN` resolving as user-defined types with
+methods now that the builtin `bytesN` is gone.
+
+These checks validate the analyzer and package, not execution by the official v1.2.1 C++
 compiler. The older upstream corpus and compiler evidence below remain deliberately
 versioned as v1.1.0 backward compatibility.
 

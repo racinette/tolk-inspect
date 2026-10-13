@@ -566,8 +566,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-analysis"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "bitflags",
  "crc",
@@ -583,8 +583,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-dataflow"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "rustc-hash",
  "tolk-resolver",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "tolk-inspect-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "tolk-inspect-wasm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "js-sys",
  "serde",
@@ -621,8 +621,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-linter"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "dunce",
  "heck",
@@ -641,8 +641,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-macros"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "heck",
  "itertools",
@@ -653,8 +653,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-resolver"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -668,8 +668,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-syntax"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "anyhow",
  "ton-syntax",
@@ -679,8 +679,8 @@ dependencies = [
 
 [[package]]
 name = "tolk-ty"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "log",
  "rustc-hash",
@@ -691,8 +691,8 @@ dependencies = [
 
 [[package]]
 name = "ton-syntax"
-version = "1.2.0"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+version = "1.2.1"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "anyhow",
  "memchr",
@@ -722,7 +722,7 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 [[package]]
 name = "tree-sitter-tolk"
 version = "0.4.5"
-source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.0#16d49e1f6ad68d67072b95c77ad9175c34ad7e17"
+source = "git+https://github.com/ton-blockchain/acton?tag=v1.2.1#13594911b09b0a9bc68910111e0bb88a74161f5b"
 dependencies = [
  "cc",
  "tree-sitter-language",

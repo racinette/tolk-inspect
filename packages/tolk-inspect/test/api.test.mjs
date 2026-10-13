@@ -41,8 +41,8 @@ test("exposes an owned semantic project facade", async () => {
 test("reports the exact analyzer revision", () => {
   assert.deepEqual(versionInfo(), {
     packageVersion: packageMetadata.version,
-    actonRevision: "16d49e1f6ad68d67072b95c77ad9175c34ad7e17",
-    tolkVersion: "1.4.2",
+    actonRevision: "13594911b09b0a9bc68910111e0bb88a74161f5b",
+    tolkVersion: "1.5.0",
   });
 });
 

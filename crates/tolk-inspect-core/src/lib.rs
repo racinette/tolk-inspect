@@ -26,8 +26,8 @@ use tolk_resolver::{
 use tolk_ty::{FileBodyTypes, TyData, TyId, TypeDb, TypeInterner, WorkspaceBodyTypes, infer};
 use tree_sitter::Node;
 
-pub const ACTON_REVISION: &str = "16d49e1f6ad68d67072b95c77ad9175c34ad7e17";
-pub const TOLK_VERSION: &str = "1.4.2";
+pub const ACTON_REVISION: &str = "13594911b09b0a9bc68910111e0bb88a74161f5b";
+pub const TOLK_VERSION: &str = "1.5.0";
 
 type ResolutionsBySpan = HashMap<(FileId, u32, u32), Resolved>;
 type CallableState = HashMap<tolk_resolver::resolve_index::LocalDefId, CallableValue>;
@@ -3348,7 +3348,6 @@ impl<'a> TypeBuilder<'a> {
             TyData::Address(_) => ("address", None, vec![], None),
             TyData::MapKV { key, value } => ("map", None, vec![key, value], None),
             TyData::Bits { .. } => ("bits", None, vec![], None),
-            TyData::Bytes { .. } => ("bytes", None, vec![], None),
             TyData::UntypedTuple => ("untypedTuple", None, vec![], None),
             TyData::Null => ("null", None, vec![], None),
             TyData::Void => ("void", None, vec![], None),
@@ -4232,6 +4231,199 @@ fun flow(x: int): int {
             constant.symbol_id == fourth.id
                 && matches!(&constant.value, ConstantValue::Int { value, .. } if value == "4")
         }));
+    }
+
+    const ACTON_1_2_1_STDLIB: &str =
+        "type int = builtin\ntype bool = builtin\ntype slice = builtin\ntype bitsN = builtin\n";
+
+    fn reachable_nodes(graph: &ControlFlowGraph) -> Vec<ControlFlowNodeId> {
+        let mut seen = vec![graph.entry.clone()];
+        let mut pending = vec![graph.entry.clone()];
+        while let Some(current) = pending.pop() {
+            for edge in graph.edges.iter().filter(|edge| edge.from == current) {
+                if !seen.contains(&edge.to) {
+                    seen.push(edge.to.clone());
+                    pending.push(edge.to.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    fn no_semantic_diagnostics(snapshot: &ProjectSnapshot) {
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.phase != "parse" && diagnostic.phase != "resolution"),
+            "{:?}",
+            snapshot.diagnostics
+        );
+    }
+
+    fn identifier_types<'a>(snapshot: &'a ProjectSnapshot, text: &str) -> Vec<&'a TypeInfo> {
+        let mut nodes = snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "identifier" && node.text == text)
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| node.location.byte_range.start);
+        nodes
+            .into_iter()
+            .filter_map(|node| {
+                let typed = snapshot
+                    .node_types
+                    .iter()
+                    .find(|entry| entry.node_id == node.id)?;
+                snapshot.types.iter().find(|ty| ty.id == typed.type_id)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn follows_acton_1_2_1_loop_control_in_control_flow_graphs() {
+        let source =
+            include_str!("../../../fixtures/projects/acton-v1.2.1-regressions/loop-control.tolk");
+        let snapshot = project_with_common_stdlib(source, ACTON_1_2_1_STDLIB);
+        no_semantic_diagnostics(&snapshot);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let local = |name: &str, owner: &SymbolId| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| {
+                    symbol.name == name && symbol.containing_symbol.as_ref() == Some(owner)
+                })
+                .expect("local symbol")
+        };
+        let graph_of = |owner: &SymbolId| {
+            snapshot
+                .control_flow_graphs
+                .iter()
+                .find(|graph| &graph.symbol_id == owner)
+                .expect("control-flow graph")
+        };
+        let text_of = |node: &ControlFlowNode| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|ast| Some(&ast.id) == node.ast_node_id.as_ref())
+                .map(|ast| ast.text.clone())
+        };
+
+        let flow = global("flow");
+        let graph = graph_of(&flow.id);
+        let node_text = |id: &ControlFlowNodeId| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| &node.id == id)
+                .and_then(text_of)
+                .unwrap_or_default()
+        };
+        let targets = |kind: &str| {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == kind)
+                .map(|edge| edge.to.clone())
+                .collect::<Vec<_>>()
+        };
+        let continues = targets("continue");
+        assert_eq!(continues.len(), 2, "{continues:?}");
+        assert_ne!(
+            continues[0], continues[1],
+            "inner and outer continue share a target"
+        );
+        assert!(
+            continues.iter().any(|id| node_text(id) == "flag > 0"),
+            "inner loop head"
+        );
+        let breaks = targets("break");
+        assert_eq!(breaks.len(), 2, "{breaks:?}");
+        assert_ne!(breaks[0], breaks[1], "inner and outer break share a target");
+        let total = local("total", &flow.id);
+        let live = reachable_nodes(graph);
+        let increment = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.writes.contains(&total.id) && text_of(node).as_deref() == Some("total += 1")
+            })
+            .expect("increment inside the loop");
+        assert!(live.contains(&increment.id));
+
+        let exit_early = global("exitEarly");
+        let graph = graph_of(&exit_early.id);
+        let live = reachable_nodes(graph);
+        let x = local("x", &exit_early.id);
+        let writes = graph
+            .nodes
+            .iter()
+            .filter(|node| node.writes.contains(&x.id))
+            .filter_map(|node| text_of(node).map(|text| (text, live.contains(&node.id))))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(writes.get("x = 4"), Some(&true), "{writes:?}");
+        assert_eq!(writes.get("x = flag"), Some(&false), "{writes:?}");
+    }
+
+    #[test]
+    fn narrows_acton_1_2_1_nullable_smart_casts() {
+        let source =
+            include_str!("../../../fixtures/projects/acton-v1.2.1-regressions/smart-casts.tolk");
+        let snapshot = project_with_common_stdlib(source, ACTON_1_2_1_STDLIB);
+        no_semantic_diagnostics(&snapshot);
+        let displays = identifier_types(&snapshot, "value")
+            .into_iter()
+            .map(|ty| ty.display.as_str())
+            .collect::<Vec<_>>();
+        assert!(displays.len() >= 2, "{displays:?}");
+        assert_eq!(displays.first(), Some(&"int?"), "{displays:?}");
+        assert_eq!(displays.last(), Some(&"int"), "{displays:?}");
+    }
+
+    #[test]
+    fn resolves_acton_1_2_1_declared_bytes_alias_as_user_type() {
+        let source =
+            include_str!("../../../fixtures/projects/acton-v1.2.1-regressions/bits-alias.tolk");
+        let snapshot = project_with_common_stdlib(source, ACTON_1_2_1_STDLIB);
+        no_semantic_diagnostics(&snapshot);
+        let global = |name: &str| {
+            snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name && !symbol.flags.local)
+                .expect("global symbol")
+        };
+        let digest = identifier_types(&snapshot, "digest");
+        assert!(!digest.is_empty());
+        for ty in &digest {
+            assert_eq!(ty.display, "bytes4");
+            assert_eq!(ty.kind, "typeAlias");
+            assert_eq!(ty.symbol_id.as_ref(), Some(&global("bytes4").id));
+        }
+        assert!(snapshot.types.iter().all(|ty| ty.kind != "bytes"));
+        assert!(
+            !snapshot
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "bytesN")
+        );
+        let check = global("check");
+        let sites = snapshot
+            .call_sites
+            .iter()
+            .filter(|site| site.caller == check.id)
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert!(sites[0].complete);
+        assert_eq!(sites[0].targets, vec![global("isValid").id.clone()]);
     }
 
     #[test]
