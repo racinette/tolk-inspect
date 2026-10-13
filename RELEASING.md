@@ -6,14 +6,21 @@ Releases are built from a clean GitHub-hosted runner and published to npm by
 ## One-time setup
 
 1. Create or claim the public `tolk-inspect` package on npm and enable account 2FA.
-2. Create a protected GitHub environment named `npm`. Add required reviewers if desired.
+2. Create a protected GitHub environment named `npm` with the package owner as a required
+   reviewer and deployments limited to `v*` tags, and add a tag ruleset restricting `v*`
+   tag creation, update, and deletion to repository admins. Publishing a GitHub release is
+   otherwise the only gate: trusted publishing never asks for npm 2FA, so the required
+   review is the explicit human approval at publish time. The workspace
+   `npm-release-policy/apply.sh` configures all three.
 3. In the npm package settings, configure GitHub as a trusted publisher:
    - owner: `racinette`
    - repository: `tolk-inspect`
    - workflow: `release.yml`
    - environment: `npm`
    - allowed action: direct publish
-4. Remove long-lived npm publication tokens after trusted publishing succeeds.
+4. Remove long-lived npm publication tokens after trusted publishing succeeds, and set the
+   package's publishing access on npm to require 2FA and disallow tokens; trusted
+   publishing is exempt from that restriction.
 
 The release workflow requires no `NPM_TOKEN`. Its OIDC identity produces npm provenance
 automatically for a public repository and package.
@@ -43,7 +50,8 @@ clean publication cannot reuse a missing or stale generated binary.
 
 1. Create a GitHub release targeting the reviewed commit with tag `v<version>`.
 2. Publish the GitHub release. Prereleases are intentionally not published by the workflow.
-3. Approve the protected `npm` environment deployment if required.
+3. Approve the protected `npm` environment deployment. The publish job waits for this
+   approval; nothing reaches npm until the owner approves it in the GitHub UI.
 4. Confirm the workflow completed and npm displays provenance for the new version.
 5. Smoke-test the registry artifact from an empty directory:
 
