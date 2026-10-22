@@ -94,6 +94,23 @@ test("rejects snapshots from another analyzer version", async () => {
   assert.throws(() => projectFromSnapshot(null), TypeError);
 });
 
+test("per-symbol lookups agree with the full lists and return fresh arrays", async () => {
+  const project = await inspectProject(input);
+  for (const symbol of project.symbols()) {
+    assert.deepEqual(project.callSites(symbol), project.callSites().filter((site) => site.caller === symbol.id));
+    assert.deepEqual(project.calls(symbol), project.callGraph().filter((call) => call.caller === symbol.id));
+    assert.deepEqual(project.callers(symbol), project.callGraph().filter((call) => call.callee === symbol.id));
+    assert.ok(project.references(symbol).every((reference) => reference.symbolId === symbol.id));
+  }
+  assert.deepEqual(project.references("missing"), []);
+  const answer = project.symbols().find((symbol) => symbol.name === "answer");
+  const references = project.references(answer);
+  references.length = 0;
+  project.callers(answer).length = 0;
+  assert.ok(project.references(answer).length > 0);
+  assert.equal(project.callers(answer).length, 1);
+});
+
 test("reports the exact analyzer revision", () => {
   assert.deepEqual(versionInfo(), {
     packageVersion: packageMetadata.version,

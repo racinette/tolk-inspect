@@ -396,6 +396,10 @@ export class InspectedProject {
   #references: readonly Reference[];
   #callSites: readonly CallSite[];
   #calls: readonly CallEdge[];
+  #referencesBySymbol = new Map<SymbolId, Reference[]>();
+  #callSitesByCaller = new Map<SymbolId, CallSite[]>();
+  #callsByCaller = new Map<SymbolId, CallEdge[]>();
+  #callsByCallee = new Map<SymbolId, CallEdge[]>();
   #diagnostics: readonly Diagnostic[];
 
   /** @internal */
@@ -432,6 +436,13 @@ export class InspectedProject {
     this.#references = snapshot.references.map((item) => ({ ...item, symbolId: item.symbolId ?? undefined, nodeId: item.nodeId ?? undefined }));
     this.#callSites = snapshot.callSites.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
     this.#calls = snapshot.callGraph.map((item) => ({ ...item, nodeId: item.nodeId ?? undefined }));
+    for (const reference of this.#references)
+      if (reference.symbolId !== undefined) group(this.#referencesBySymbol, reference.symbolId, reference);
+    for (const callSite of this.#callSites) group(this.#callSitesByCaller, callSite.caller, callSite);
+    for (const call of this.#calls) {
+      group(this.#callsByCaller, call.caller, call);
+      group(this.#callsByCallee, call.callee, call);
+    }
     this.#diagnostics = snapshot.diagnostics.map((item) => ({
       ...item,
       code: item.code ?? undefined,
@@ -484,7 +495,7 @@ export class InspectedProject {
 
   references(symbol: SymbolId | SymbolInfo): readonly Reference[] {
     this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
-    return this.#references.filter((reference) => reference.symbolId === id);
+    return [...(this.#referencesBySymbol.get(id) ?? [])];
   }
 
   typeOf(node: NodeId | AstNode): TypeInfo | undefined {
@@ -509,17 +520,17 @@ export class InspectedProject {
     this.#active();
     if (symbol === undefined) return this.#callSites;
     const id = typeof symbol === "string" ? symbol : symbol.id;
-    return this.#callSites.filter((callSite) => callSite.caller === id);
+    return [...(this.#callSitesByCaller.get(id) ?? [])];
   }
 
   callGraph(): readonly CallEdge[] { this.#active(); return this.#calls }
   calls(symbol: SymbolId | SymbolInfo): readonly CallEdge[] {
     this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
-    return this.#calls.filter((call) => call.caller === id);
+    return [...(this.#callsByCaller.get(id) ?? [])];
   }
   callers(symbol: SymbolId | SymbolInfo): readonly CallEdge[] {
     this.#active(); const id = typeof symbol === "string" ? symbol : symbol.id;
-    return this.#calls.filter((call) => call.callee === id);
+    return [...(this.#callsByCallee.get(id) ?? [])];
   }
   diagnostics(): readonly Diagnostic[] { this.#active(); return this.#diagnostics }
 
@@ -529,6 +540,8 @@ export class InspectedProject {
     this.#symbolByNode.clear(); this.#resolutionByNode.clear(); this.#typeByNode.clear();
     this.#constantBySymbol.clear();
     this.#controlFlowBySymbol.clear();
+    this.#referencesBySymbol.clear(); this.#callSitesByCaller.clear();
+    this.#callsByCaller.clear(); this.#callsByCallee.clear();
     this.#references = []; this.#callSites = []; this.#calls = []; this.#diagnostics = [];
   }
 
@@ -575,6 +588,10 @@ export function projectFromSnapshot(snapshot: ProjectSnapshot): InspectedProject
 export function versionInfo(): VersionInfo { return wasm.versionInfo() as VersionInfo }
 
 function isDefined<T>(value: T | undefined): value is T { return value !== undefined }
+function group<K, V>(index: Map<K, V[]>, key: K, value: V): void {
+  const values = index.get(key);
+  if (values) values.push(value); else index.set(key, [value]);
+}
 function controlFlowNodeId(node: ControlFlowNodeLike): ControlFlowNodeId {
   return typeof node === "string" ? node : node.id;
 }

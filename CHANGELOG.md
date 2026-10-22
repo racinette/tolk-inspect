@@ -12,6 +12,12 @@ Versioning; while the package is below 1.0, minor releases may change the public
   so one analysis can be shared with worker threads. Snapshots are accepted only by the
   exact analyzer version that produced them.
 
+### Changed
+
+- `references`, `callSites(symbol)`, `calls`, and `callers` look up per-symbol indexes built
+  when the project opens instead of scanning every reference or call. Results and their
+  order are unchanged, and each call still returns a fresh array.
+
 ## 0.1.3 - 2026-10-13
 
 ### Changed
