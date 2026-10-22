@@ -103,6 +103,32 @@ tuple/map round trips, tuple destructuring, and stdlib `lisp_list` operations. S
 [callable-flow audit](docs/callable-flow-audit.md) for the exact boundary.
 `versionInfo()` reports the package, pinned Acton revision, and analyzer Tolk version.
 
+## Snapshots
+
+`inspectProjectSnapshot(input)` runs the same analysis as `inspectProject` but returns plain
+data. A snapshot survives structured cloning and JSON, so one analysis can be shared with
+worker threads or child processes; `projectFromSnapshot(snapshot)` opens it there as an
+ordinary project.
+
+```ts
+import { Worker } from "node:worker_threads";
+import { inspectProjectSnapshot } from "tolk-inspect";
+
+const snapshot = await inspectProjectSnapshot(input);
+new Worker(new URL("./worker.mjs", import.meta.url), { workerData: snapshot });
+
+// worker.mjs
+import { workerData } from "node:worker_threads";
+import { projectFromSnapshot } from "tolk-inspect";
+
+const project = projectFromSnapshot(workerData);
+```
+
+Only `snapshot.version` is public; the rest of the format is internal and may change in any
+release. `projectFromSnapshot` throws a `TypeError` unless `snapshot.version` equals `versionInfo()`
+of the running package. The opened project shares the snapshot's data, so
+treat the snapshot as immutable. Disposing a project leaves its snapshot usable.
+
 ## Build and test
 
 Prerequisites are Rust 1.97.1 with `wasm32-unknown-unknown`, Node.js 22+, npm,

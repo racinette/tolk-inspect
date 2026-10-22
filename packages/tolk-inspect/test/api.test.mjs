@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { inspectProject, versionInfo } from "../dist/index.js";
+import { Worker } from "node:worker_threads";
+import { inspectProject, inspectProjectSnapshot, projectFromSnapshot, versionInfo } from "../dist/index.js";
 
 const packageMetadata = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
@@ -36,6 +37,61 @@ test("exposes an owned semantic project facade", async () => {
 
   project.dispose();
   assert.throws(() => project.files(), /disposed/);
+});
+
+function summarize(project) {
+  const answer = project.symbols().find((symbol) => symbol.name === "answer");
+  return {
+    files: project.files().map((file) => [file.path, file.ast.id, [...file.ast.descendants()].length]),
+    symbols: project.symbols().map((symbol) => symbol.fqn),
+    references: project.references(answer).map((item) => [item.nodeId, item.context.usage]),
+    callers: project.callers(answer).map((call) => call.caller),
+    type: project.typeOf(project.node(answer.nodeId))?.display,
+    diagnostics: project.diagnostics().map((diagnostic) => [diagnostic.phase, diagnostic.message]),
+    controlFlow: project.controlFlowGraphs().map((graph) => [graph.symbolId, graph.nodes.length, graph.edges.length]),
+  };
+}
+
+test("opens a cloned snapshot as the same project", async () => {
+  const expected = summarize(await inspectProject(input));
+  const snapshot = await inspectProjectSnapshot(input);
+  assert.deepEqual(snapshot.version, versionInfo());
+  assert.deepEqual(summarize(projectFromSnapshot(structuredClone(snapshot))), expected);
+  assert.deepEqual(summarize(projectFromSnapshot(JSON.parse(JSON.stringify(snapshot)))), expected);
+
+  const first = projectFromSnapshot(snapshot);
+  first.dispose();
+  assert.deepEqual(summarize(projectFromSnapshot(snapshot)), expected);
+});
+
+test("opens a snapshot transferred to a worker thread", async () => {
+  const snapshot = await inspectProjectSnapshot(input);
+  const source = `
+    import { parentPort, workerData } from "node:worker_threads";
+    const { projectFromSnapshot } = await import(workerData.module);
+    const project = projectFromSnapshot(workerData.snapshot);
+    const answer = project.symbols().find((symbol) => symbol.name === "answer");
+    parentPort.postMessage(project.callers(answer).map((call) => project.symbol(call.caller)?.name));`;
+  const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(source)}`), {
+    workerData: { module: new URL("../dist/index.js", import.meta.url).href, snapshot },
+  });
+  try {
+    const callers = await new Promise((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    assert.deepEqual(callers, ["main"]);
+  } finally {
+    await worker.terminate();
+  }
+});
+
+test("rejects snapshots from another analyzer version", async () => {
+  const snapshot = await inspectProjectSnapshot(input);
+  const other = { ...snapshot, version: { ...snapshot.version, actonRevision: "0".repeat(40) } };
+  assert.throws(() => projectFromSnapshot(other), /Not a tolk-inspect .* snapshot/);
+  assert.throws(() => projectFromSnapshot({}), TypeError);
+  assert.throws(() => projectFromSnapshot(null), TypeError);
 });
 
 test("reports the exact analyzer revision", () => {

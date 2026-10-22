@@ -3,6 +3,15 @@
 Notable changes to `tolk-inspect` are documented here. The project follows Semantic
 Versioning; while the package is below 1.0, minor releases may change the public API.
 
+## Unreleased
+
+### Added
+
+- `inspectProjectSnapshot(input)` returns the analysis as plain data that survives
+  structured cloning and JSON, and `projectFromSnapshot(snapshot)` reopens it as a project,
+  so one analysis can be shared with worker threads. Snapshots are accepted only by the
+  exact analyzer version that produced them.
+
 ## 0.1.3 - 2026-10-13
 
 ### Changed

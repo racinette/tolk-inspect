@@ -202,6 +202,18 @@ interface Snapshot {
   callGraph: CallEdge[]; diagnostics: Diagnostic[];
 }
 
+declare const projectSnapshot: unique symbol;
+
+/**
+ * Plain analysis data from `inspectProjectSnapshot`. It survives structured cloning and
+ * JSON round trips; `projectFromSnapshot` accepts it only from the same analyzer version.
+ * Its other fields are internal and may change in any release.
+ */
+export interface ProjectSnapshot {
+  readonly version: VersionInfo;
+  readonly [projectSnapshot]: true;
+}
+
 export class AstNode {
   readonly id: NodeId;
   readonly kind: string;
@@ -524,6 +536,11 @@ export class InspectedProject {
 }
 
 export async function inspectProject(input: ProjectInput): Promise<InspectedProject> {
+  return projectFromSnapshot(await inspectProjectSnapshot(input));
+}
+
+/** Analyzes a project into plain data that can be transferred and opened elsewhere. */
+export async function inspectProjectSnapshot(input: ProjectInput): Promise<ProjectSnapshot> {
   const files = input.files instanceof Map ? Object.fromEntries(input.files) : { ...input.files };
   const wireInput = {
     root: input.root,
@@ -534,7 +551,25 @@ export async function inspectProject(input: ProjectInput): Promise<InspectedProj
     importMappings: { ...(input.importMappings ?? {}) },
     controlFlow: input.controlFlow ?? "workspace",
   };
-  return new InspectedProject(wasm.inspectProjectSnapshot(wireInput) as Snapshot);
+  return wasm.inspectProjectSnapshot(wireInput) as ProjectSnapshot;
+}
+
+/**
+ * Opens a snapshot produced by this analyzer version. The project shares the snapshot's
+ * data, so neither may be mutated; disposing the project leaves the snapshot usable.
+ */
+export function projectFromSnapshot(snapshot: ProjectSnapshot): InspectedProject {
+  const version = (snapshot as { version?: Partial<VersionInfo> } | null)?.version;
+  const expected = versionInfo();
+  if (
+    version?.packageVersion !== expected.packageVersion ||
+    version.actonRevision !== expected.actonRevision ||
+    version.tolkVersion !== expected.tolkVersion
+  )
+    throw new TypeError(
+      `Not a tolk-inspect ${expected.packageVersion} snapshot (Acton ${expected.actonRevision})`,
+    );
+  return new InspectedProject(snapshot as unknown as Snapshot);
 }
 
 export function versionInfo(): VersionInfo { return wasm.versionInfo() as VersionInfo }

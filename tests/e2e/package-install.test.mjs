@@ -27,18 +27,23 @@ assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /inspectP
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /ReferenceAccess/);
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /constantValue/);
 assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /controlFlow/);
+assert.match(readFileSync(join(installed, "dist/index.d.ts"), "utf8"), /projectFromSnapshot/);
 
 writeFileSync(join(consumer, "consumer.mjs"), `
   import assert from "node:assert/strict";
-  import { inspectProject, versionInfo } from "tolk-inspect";
-  const project = await inspectProject({
+  import { inspectProject, inspectProjectSnapshot, projectFromSnapshot, versionInfo } from "tolk-inspect";
+  const input = {
     root: "/project",
     files: {
       "/project/main.tolk": 'import "messages";\\nfun main() { helper(); }',
       "/project/messages.tolk": "const ANSWER = 7; fun helper(): int { return ANSWER; }"
     },
     entrypoints: ["/project/main.tolk"]
-  });
+  };
+  const project = await inspectProject(input);
+  const restored = projectFromSnapshot(structuredClone(await inspectProjectSnapshot(input)));
+  assert.deepEqual(restored.symbols(), project.symbols());
+  assert.deepEqual(restored.callGraph(), project.callGraph());
   const helper = project.symbols().find((symbol) => symbol.name === "helper");
   assert.ok(helper);
   assert.equal(project.callers(helper).length, 1);
@@ -65,7 +70,14 @@ writeFileSync(join(consumer, "consumer.mjs"), `
 run(process.execPath, [join(consumer, "consumer.mjs")], consumer);
 
 writeFileSync(join(consumer, "consumer.ts"), `
-  import { inspectProject, type ProjectInput, type SymbolInfo } from ${JSON.stringify(packageName)};
+  import {
+    inspectProject,
+    inspectProjectSnapshot,
+    projectFromSnapshot,
+    type ProjectInput,
+    type ProjectSnapshot,
+    type SymbolInfo,
+  } from ${JSON.stringify(packageName)};
 
   const input: ProjectInput = {
     root: "/project",
@@ -79,7 +91,13 @@ writeFileSync(join(consumer, "consumer.ts"), `
     return symbols;
   }
 
+  async function reopen(): Promise<string> {
+    const snapshot: ProjectSnapshot = await inspectProjectSnapshot(input);
+    return projectFromSnapshot(structuredClone(snapshot)).version.packageVersion;
+  }
+
   void inspect();
+  void reopen();
 `);
 writeFileSync(join(consumer, "tsconfig.json"), JSON.stringify({
   compilerOptions: {
