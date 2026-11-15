@@ -61,6 +61,6 @@ clean publication cannot reuse a missing or stale generated binary.
    node --input-type=module -e 'import { versionInfo } from "tolk-inspect"; console.log(versionInfo())'
    ```
 
-6. Confirm the reported package version and Acton revision, then close the milestone.
+6. Confirm the reported package version and Acton revision.
 
 Never reuse or move a published version tag. Fix a bad release with a new patch version.
