@@ -29,6 +29,12 @@ use tree_sitter::Node;
 pub const ACTON_REVISION: &str = "13594911b09b0a9bc68910111e0bb88a74161f5b";
 pub const TOLK_VERSION: &str = "1.5.0";
 
+type ReferencesAndCalls = (
+    Vec<Reference>,
+    Vec<Resolution>,
+    Vec<CallSite>,
+    Vec<CallEdge>,
+);
 type ResolutionsBySpan = HashMap<(FileId, u32, u32), Resolved>;
 type CallableState = HashMap<tolk_resolver::resolve_index::LocalDefId, CallableValue>;
 type ParameterValues = HashMap<SymbolId, Vec<Option<CallableValue>>>;
@@ -42,6 +48,9 @@ type ConstantKeys = HashMap<tolk_resolver::SymbolId, String>;
 const DYNAMIC_MEMBER: &str = "\0dynamic";
 const MAP_VALUE_MEMBER: &str = "\0map-value";
 const MAX_TRACKED_ARRAY_LENGTHS: usize = 16;
+// The callable-value solver converges in a few visits per flow node. Exceeding this budget
+// means its join stopped being monotone, so fail instead of spinning forever.
+const MAX_CALLABLE_STATE_VISITS_PER_NODE: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectionKind {
@@ -583,7 +592,7 @@ impl<'a> SnapshotBuilder<'a> {
         let control_flow_graphs =
             self.collect_control_flow_graphs(&mut analysis_db, &type_db, &indexed_files);
         let (references, resolutions, call_sites, call_graph) =
-            self.collect_references_and_calls(&body_types, &mut analysis_db, &type_db);
+            self.collect_references_and_calls(&body_types, &mut analysis_db, &type_db)?;
         drop(type_db);
         let workspace_file_ids = indexed_files
             .iter()
@@ -1042,12 +1051,7 @@ impl<'a> SnapshotBuilder<'a> {
         bodies: &WorkspaceBodyTypes,
         analysis_db: &mut AnalysisDb,
         type_db: &TypeDb<'_>,
-    ) -> (
-        Vec<Reference>,
-        Vec<Resolution>,
-        Vec<CallSite>,
-        Vec<CallEdge>,
-    ) {
+    ) -> Result<ReferencesAndCalls> {
         let mut uses = BTreeMap::<(FileId, u32, u32, String), &NameUse>::new();
         for (&file_id, index) in self.project.resolved_uses() {
             for usage in &index.uses {
@@ -1166,7 +1170,7 @@ impl<'a> SnapshotBuilder<'a> {
             &resolved_by_span,
             &program_calls,
             &lambda_creations,
-        );
+        )?;
         normalize_call_sites(&mut call_sites);
         let mut calls = call_sites
             .iter()
@@ -1182,7 +1186,7 @@ impl<'a> SnapshotBuilder<'a> {
             .collect::<Vec<_>>();
         calls.sort_by(|a, b| call_key(a).cmp(&call_key(b)));
         calls.dedup_by(|a, b| call_key(a) == call_key(b));
-        (references, resolutions, call_sites, calls)
+        Ok((references, resolutions, call_sites, calls))
     }
 
     fn collect_program_calls(&self) -> (Vec<ProgramCall>, Vec<LambdaCreation>) {
@@ -1382,7 +1386,7 @@ impl<'a> SnapshotBuilder<'a> {
         resolved_by_span: &ResolutionsBySpan,
         calls: &[ProgramCall],
         lambda_creations: &[LambdaCreation],
-    ) -> Vec<CallSite> {
+    ) -> Result<Vec<CallSite>> {
         let definitions = self.callable_definitions(type_db, analysis_db);
         let mut calls_by_caller = HashMap::<SymbolId, Vec<ProgramCall>>::new();
         for call in calls {
@@ -1424,7 +1428,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &captures,
                 lambda_creations,
                 false,
-            );
+            )?;
             let stable = analysis.parameters == parameters
                 && analysis.returns == returns
                 && analysis.mutations == mutations
@@ -1452,7 +1456,7 @@ impl<'a> SnapshotBuilder<'a> {
                 &captures,
                 lambda_creations,
                 true,
-            );
+            )?;
             let stable = analysis.parameters == parameters
                 && analysis.returns == returns
                 && analysis.mutations == mutations
@@ -1466,7 +1470,7 @@ impl<'a> SnapshotBuilder<'a> {
                 break;
             }
         }
-        call_sites
+        Ok(call_sites)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1481,7 +1485,7 @@ impl<'a> SnapshotBuilder<'a> {
         capture_values: &CaptureValues,
         lambda_creations: &[LambdaCreation],
         external_unknown: bool,
-    ) -> ProgramAnalysis {
+    ) -> Result<ProgramAnalysis> {
         let mut result = ProgramAnalysis {
             parameters: definitions
                 .iter()
@@ -1538,14 +1542,21 @@ impl<'a> SnapshotBuilder<'a> {
                         }),
                 );
             }
-            let states = self.callable_states(
-                definition.file_id,
-                graph,
-                resolved_by_span,
-                initial,
-                return_values,
-                mutation_values,
-            );
+            let states = self
+                .callable_states(
+                    definition.file_id,
+                    graph,
+                    resolved_by_span,
+                    initial,
+                    return_values,
+                    mutation_values,
+                )
+                .with_context(|| {
+                    format!(
+                        "while analysing callable values of {}",
+                        self.describe_callable(public_id)
+                    )
+                })?;
             if let Some(exit_state) = states[graph.exit().index()].as_ref()
                 && let Some(outputs) = result.mutations.get_mut(public_id)
             {
@@ -1665,7 +1676,24 @@ impl<'a> SnapshotBuilder<'a> {
                 }
             }
         }
-        result
+        Ok(result)
+    }
+
+    fn describe_callable(&self, id: &SymbolId) -> String {
+        self.symbols
+            .iter()
+            .find(|symbol| symbol.id == *id)
+            .map_or_else(
+                || format!("`{id}`"),
+                |symbol| {
+                    format!(
+                        "`{}` ({}:{})",
+                        symbol.fqn,
+                        symbol.declaration.path,
+                        symbol.declaration.range.start.line + 1
+                    )
+                },
+            )
     }
 
     fn callable_return_value(
@@ -1776,12 +1804,24 @@ impl<'a> SnapshotBuilder<'a> {
         initial: CallableState,
         return_values: &ReturnValues,
         mutation_values: &MutationValues,
-    ) -> Vec<Option<CallableState>> {
+    ) -> Result<Vec<Option<CallableState>>> {
         let mut incoming = vec![None; graph.node_count()];
         incoming[graph.entry().index()] = Some(initial);
         let mut work = VecDeque::from([graph.entry()]);
+        let max_visits = graph
+            .node_count()
+            .saturating_mul(MAX_CALLABLE_STATE_VISITS_PER_NODE);
+        let mut visits = 0usize;
 
         while let Some(node_id) = work.pop_front() {
+            visits += 1;
+            if visits > max_visits {
+                bail!(
+                    "callable-value analysis did not converge after {max_visits} steps over \
+                     {} flow nodes; this is a bug in tolk-inspect, please report it",
+                    graph.node_count()
+                );
+            }
             let Some(state) = incoming[node_id.index()].clone() else {
                 continue;
             };
@@ -1813,7 +1853,7 @@ impl<'a> SnapshotBuilder<'a> {
                 }
             }
         }
-        incoming
+        Ok(incoming)
     }
 
     fn transfer_callable_state(
@@ -2006,6 +2046,11 @@ impl<'a> SnapshotBuilder<'a> {
         let arguments = Self::call_arguments(node);
         let mut collection =
             self.callable_value(file_id, receiver, state, resolved_by_span, return_values);
+        // No value reaches the receiver yet. Bottom must stay member-free to remain the
+        // identity of the join, otherwise the worklist solver may never converge.
+        if collection.bottom {
+            return;
+        }
         let changed = match (kind, method.as_str()) {
             (CollectionKind::Array, "push") => {
                 let Some(value) = arguments.first() else {
@@ -2610,7 +2655,9 @@ impl<'a> SnapshotBuilder<'a> {
             ) => Some(Self::map_lookup_result(collection.any_member())),
             (CollectionKind::Map, "set") => {
                 let mut updated = collection;
-                if let Some(value) = arguments.get(1) {
+                if !updated.bottom
+                    && let Some(value) = arguments.get(1)
+                {
                     let value = self.callable_value_depth(
                         file_id,
                         *value,
@@ -6038,5 +6085,26 @@ fun publicEntry(callback: ((int) -> int), value: int): int {
             Some("/vendor/lib.tolk")
         );
         assert_eq!(snapshot.call_graph.len(), 1);
+    }
+
+    #[test]
+    fn terminates_on_dynamic_map_writes_to_an_uncalled_parameter_in_a_loop() {
+        let source = r#"
+struct Card { key: int, card: int }
+
+fun f(cards: map<int, Card>, count: int): void {
+    var position = 0;
+    repeat (count) {
+        if (position != 7) {
+            val dealt = cards.mustGet(position);
+            cards.set(position, Card { key: dealt.key, card: 1 });
+            if (position > 3) { position += 1; }
+        }
+        position += 1;
+    }
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        assert!(snapshot.symbols.iter().any(|symbol| symbol.name == "f"));
     }
 }

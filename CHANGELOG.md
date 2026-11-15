@@ -3,6 +3,20 @@
 Notable changes to `tolk-inspect` are documented here. The project follows Semantic
 Versioning; while the package is below 1.0, minor releases may change the public API.
 
+## Unreleased
+
+### Fixed
+
+- `inspectProject` no longer hangs on a function that writes to a map or array parameter
+  under a dynamic key inside a loop with branches. The callable-value solver kept adding
+  members to a value that had no inputs yet, so its states alternated forever instead of
+  converging.
+
+### Changed
+
+- The callable-value solver is bounded per function. If it ever fails to converge,
+  `inspectProject` rejects with an error naming the function instead of spinning.
+
 ## 0.1.4 - 2026-10-22
 
 ### Added
