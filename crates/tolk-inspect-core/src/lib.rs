@@ -23,8 +23,18 @@ use tolk_resolver::{
     FileDb, FileId, NameUse, NameUseKind, ProjectIndex, ProjectSource, ProjectSourceProvider,
     Resolved, Span, Symbol, SymbolKind,
 };
+use tolk_syntax::{Assign, Call, CallArgument, SetAssign, TryFromNode};
 use tolk_ty::{FileBodyTypes, TyData, TyId, TypeDb, TypeInterner, WorkspaceBodyTypes, infer};
 use tree_sitter::Node;
+
+/// Syntax that keeps a reference on a call's receiver path, so the call acts on the reference.
+const RECEIVER_PATH_KINDS: [&str; 5] = [
+    "dot_access",
+    "generic_instantiation",
+    "parenthesized_expression",
+    "not_null_operator",
+    "cast_as_operator",
+];
 
 pub const ACTON_REVISION: &str = "13594911b09b0a9bc68910111e0bb88a74161f5b";
 pub const TOLK_VERSION: &str = "1.5.0";
@@ -579,10 +589,13 @@ impl<'a> SnapshotBuilder<'a> {
                 let Some(symbol) = info.find_declaration(&declaration) else {
                     continue;
                 };
-                bodies.insert(
-                    symbol.id,
-                    infer(&mut type_db, file.id, symbol.id, &declaration),
-                );
+                let mut inference = infer(&mut type_db, file.id, symbol.id, &declaration);
+                // Acton records object-literal field keys after their values but looks references
+                // up by binary search, so a missed method lookup would be reported as a mutation.
+                inference
+                    .resolved_refs
+                    .sort_by_key(|usage| (usage.span.start, usage.span.end));
+                bodies.insert(symbol.id, inference);
             }
             body_types.insert(file.id, bodies);
         }
@@ -1104,10 +1117,15 @@ impl<'a> SnapshotBuilder<'a> {
                 .exact_node(file_id, usage.span)
                 .or_else(|| self.smallest_node(file_id, usage.span));
             let is_call = self.call_node(file_id, usage.span);
-            let access_flags = analysis_db
+            let mut access_flags = analysis_db
                 .use_facts(self.file_db, self.project, bodies, file_id)
                 .and_then(|facts| facts.per_usage.get(&usage.span).copied())
                 .unwrap_or(UseFlags::READ);
+            if access_flags.intersects(UseFlags::WRITE | UseFlags::MUTATE)
+                && self.only_feeds_a_temporary_receiver(file_id, usage.span)
+            {
+                access_flags = UseFlags::READ;
+            }
             let access = ReferenceAccess {
                 read: access_flags.contains(UseFlags::READ),
                 write: access_flags.contains(UseFlags::WRITE),
@@ -3273,6 +3291,7 @@ impl<'a> SnapshotBuilder<'a> {
         let info = self.file_db.get_by_id(file_id)?;
         let mut node = info.find_node_at_span(span)?;
         loop {
+            node = node.parent()?;
             if node.kind() == "function_call" {
                 let callee = node.child_by_field_name("callee")?;
                 if callee.start_byte() <= span.start() && callee.end_byte() >= span.end() {
@@ -3283,8 +3302,54 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 return None;
             }
-            node = node.parent()?;
+            // Only the callee and its receiver path take part in the call; a value computed
+            // elsewhere in the receiver, such as an object-literal field, is a plain use.
+            if !RECEIVER_PATH_KINDS.contains(&node.kind()) {
+                return None;
+            }
         }
+    }
+
+    /// Acton gives a reference the access of the first method call whose receiver contains it,
+    /// even when the reference only feeds a temporary receiver: an object-literal field, a call
+    /// argument or a call result. Tolk copies values, so that call cannot write the reference.
+    /// Replays Acton's walk and reports whether it stopped at such a call.
+    fn only_feeds_a_temporary_receiver(&self, file_id: FileId, span: Span) -> bool {
+        let Some(info) = self.file_db.get_by_id(file_id) else {
+            return false;
+        };
+        let root = info.source().tree.root_node();
+        let Some(usage) = root.descendant_for_byte_range(span.start(), span.end()) else {
+            return false;
+        };
+        let mut on_receiver_path = true;
+        let mut current = usage.parent();
+        while let Some(node) = current {
+            if Assign::try_from_node(node).is_ok() || SetAssign::try_from_node(node).is_ok() {
+                return false;
+            }
+            if let Ok(argument) = CallArgument::try_from_node(node) {
+                if argument.mutate() {
+                    return false;
+                }
+                on_receiver_path = false;
+            } else if let Ok(call) = Call::try_from_node(node) {
+                let in_receiver = call.callee_qualifier().is_some_and(|qualifier| {
+                    qualifier.syntax().byte_range().contains(&span.start())
+                });
+                let is_method = call.callee_identifier().is_some_and(|callee| {
+                    callee.start_byte() == span.start() && callee.end_byte() == span.end()
+                });
+                if call.callee_qualifier().is_some() && (in_receiver || is_method) {
+                    return !on_receiver_path;
+                }
+                on_receiver_path = false;
+            } else if !RECEIVER_PATH_KINDS.contains(&node.kind()) {
+                on_receiver_path = false;
+            }
+            current = node.parent();
+        }
+        false
     }
 
     fn exact_node(&self, file_id: FileId, span: Span) -> Option<NodeId> {
@@ -6106,5 +6171,63 @@ fun f(cards: map<int, Card>, count: int): void {
 "#;
         let snapshot = project_with_stdlib(source);
         assert!(snapshot.symbols.iter().any(|symbol| symbol.name == "f"));
+    }
+
+    #[test]
+    fn reads_inside_a_literal_receiver_nested_in_another_literal_stay_reads() {
+        let source = r#"
+struct Inner { key: int }
+struct Outer { packed: array<unknown> }
+struct Msg { key: int }
+
+fun Msg.nested(self): Outer {
+    return Outer { packed: Inner { key: self.key }.toTuple() };
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let reference = |name: &str| {
+            snapshot
+                .references
+                .iter()
+                .find(|reference| reference.name == name)
+                .unwrap_or_else(|| panic!("missing reference to `{name}`"))
+        };
+        let receiver_field = reference("self");
+        assert_eq!(receiver_field.context.usage, "read");
+        assert!(!receiver_field.context.access.write);
+        assert!(!receiver_field.context.access.mutate);
+        let method = reference("toTuple");
+        assert_eq!(method.context.usage, "call");
+        assert!(!method.context.access.mutate);
+    }
+
+    #[test]
+    fn arguments_of_a_chained_mutating_call_are_not_mutated_by_the_next_call() {
+        let source = r#"
+fun chained(key: int, value: int): map<int, int> {
+    var entries = createEmptyMap<int, int>();
+    entries.set(key, value).set(1, 2);
+    return entries;
+}
+"#;
+        let snapshot = project_with_stdlib(source);
+        let context = |name: &str| {
+            snapshot
+                .references
+                .iter()
+                .find(|reference| reference.name == name)
+                .unwrap_or_else(|| panic!("missing reference to `{name}`"))
+                .context
+                .clone()
+        };
+        for argument in ["key", "value"] {
+            let context = context(argument);
+            assert_eq!(context.usage, "read", "{argument}");
+            assert!(!context.access.write, "{argument}");
+            assert!(!context.access.mutate, "{argument}");
+        }
+        let receiver = context("entries");
+        assert_eq!(receiver.usage, "call");
+        assert!(receiver.access.mutate);
     }
 }

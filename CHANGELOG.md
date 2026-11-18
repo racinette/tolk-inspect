@@ -3,6 +3,22 @@
 Notable changes to `tolk-inspect` are documented here. The project follows Semantic
 Versioning; while the package is below 1.0, minor releases may change the public API.
 
+## Unreleased
+
+### Fixed
+
+- A reference that only reads a value inside an object-literal field nested in another
+  object literal, such as `self` in `Outer { inner: Inner { key: self.key }.toCell() }`, is
+  no longer reported as a write and mutation. Acton stores an object literal's field keys out
+  of source order, so the method lookup missed and was treated as a mutating call. ([#1](https://github.com/racinette/tolk-inspect/issues/1))
+- An argument of a chained `mutate self` call, such as `value` in
+  `beginCell().storeUint(value, 32).storeUint(1, 8)` or `entries.set(key, value).set(1, 2)`, is
+  no longer reported as a write and mutation. Acton applied the next call's `mutate self` to
+  every reference inside its receiver, including the previous call's arguments. ([#1](https://github.com/racinette/tolk-inspect/issues/1))
+- A reference inside a call's receiver is reported as `usage: "call"` only when it lies on the
+  receiver path, as `counter` does in `counter.increment()`. Values computed inside the receiver,
+  such as object-literal fields, are now plain reads. ([#1](https://github.com/racinette/tolk-inspect/issues/1))
+
 ## 0.1.5 - 2026-11-15
 
 ### Fixed
